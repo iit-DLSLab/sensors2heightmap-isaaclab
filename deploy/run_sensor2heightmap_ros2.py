@@ -1,101 +1,127 @@
+"""Runs the terrain reconstructor on the robot and publishes the heightmap on /height_scan_markers, the topic
+read by basic-locomotion's run_controller_ros2.py.
+
+    python deploy/run_sensor2heightmap_ros2.py --model <model>.ts [--robot go2]
+"""
+
 import os
 
-# Fail-safe: se non è stato scelto esplicitamente altro,
-# ROS 2 comunica solamente sulla macchina locale.
 os.environ.setdefault("ROS_LOCALHOST_ONLY", "1")
 
-# ROS 2 imports
+import argparse
+import sys
+import time
+from pathlib import Path
+
+import numpy as np
 import rclpy
+import torch
+from dls2_interface.msg import BlindState, Imu
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
-from sensor_msgs.msg import Image
+from sensor_msgs.msg import Image, PointCloud2
+from visualization_msgs.msg import Marker, MarkerArray
 
-# Python imports
-import time
-import numpy as np
-
-import config
-
-
-def decimate_depth(depth: np.ndarray, factor: int, min_valid_fraction: float = 0.5, depth_scale: float = 0.001) -> np.ndarray:
-    """Depth [H, W] (raw units, 0 where invalid) to [H / factor, W / factor] in meters: the median of the valid pixels
-    of each factor x factor block, 0 where less than min_valid_fraction of them are valid.
-
-    The decimation filter of the RealSense driver averages the valid pixels of a block instead, so a block of the
-    invalid band on the left with a single false match keeps its depth, meters off: about 2 such pixels per frame at
-    848x480 -> 106x60, against 0.1 with this filter, which loses about 2% of the valid pixels.
-    """
-    height, width = depth.shape[0] // factor, depth.shape[1] // factor
-    blocks = depth[: height * factor, : width * factor].reshape(height, factor, width, factor).swapaxes(1, 2)
-    blocks = np.sort(blocks.reshape(height, width, factor * factor), axis=-1)
-    # The invalid pixels (0) sort first: the valid ones are the last n of each block.
-    size = factor * factor
-    n = np.count_nonzero(blocks, axis=-1)
-    low = np.take_along_axis(blocks, np.minimum(size - n + (n - 1) // 2, size - 1)[..., None], -1)[..., 0]
-    high = np.take_along_axis(blocks, np.minimum(size - n + n // 2, size - 1)[..., None], -1)[..., 0]
-    median = 0.5 * (low.astype(np.float32) + high.astype(np.float32)) * depth_scale
-    return np.where(n >= min_valid_fraction * size, median, 0.0).astype(np.float32)
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import robots  # noqa: E402
+from sensors import lidar_grid  # noqa: E402
+from sensors.sensor_model import TOPICS  # noqa: E402
+from terrain_reconstructor import TerrainReconstructor  # noqa: E402
 
 
-class DepthToHeightmapROS2(Node):
-    """RealSense depth (deploy/camera_connect.sh, 848x480) decimated to the depth camera of the policy (106x60), for
-    the height map of the policy. The height map is not computed yet."""
+class Sensor2HeightmapROS2(Node):
+    def __init__(self, model: str, robot: str, topic: str | None = None):
+        super().__init__("Sensor2HeightmapROS2")
+        self.reconstructor = TerrainReconstructor(model, robots.load(robot).MESSAGE_JOINT_NAMES)
+        config = self.reconstructor.config
+        self.imu = self.joints = None
+        self.sensor_arrived = False
+        self._last_warning_time = 0.0
+        heightmap = config["heightmap"]
+        rows, cols = heightmap["shape"]
+        x = heightmap["offset"][0] - heightmap["size"][0] / 2 + heightmap["resolution"] * np.arange(cols)
+        y = heightmap["offset"][1] - heightmap["size"][1] / 2 + heightmap["resolution"] * np.arange(rows)
+        self.cells = np.stack(np.meshgrid(x, y), axis=-1).reshape(-1, 2)
 
-    def __init__(self):
-        super().__init__('DepthToHeightmapROS2')
-
-        # Depth camera of the policy (depth_camera_d435 of go2_env_cfg.py); the policies exported before the D435 model
-        # have the same 106x60 camera.
-        d435 = config.training_env.get("depth_camera_d435", {"width": 106, "height": 60})
-        self.depth_width, self.depth_height = d435["width"], d435["height"]
-        # Last decimated depth [height, width] in meters, 0 where invalid.
-        self.depth_image = None
-        self.first_message_depth_arrived = False
-        self._last_depth_warning_time = 0.0
-
-        # Subscribers and Publishers
-        self.subscription_depth = self.create_subscription(
-            Image, "/camera/camera/depth/image_rect_raw", self.get_depth_callback, qos_profile_sensor_data
+        topic = topic or TOPICS[self.reconstructor.kind]
+        if self.reconstructor.kind == "lidar":
+            self.create_subscription(PointCloud2, topic, self.lidar_callback, qos_profile_sensor_data)
+        else:
+            self.create_subscription(Image, topic, self.depth_callback, qos_profile_sensor_data)
+        self.create_subscription(Imu, "/imu", self.imu_callback, 1)
+        self.create_subscription(BlindState, "/blind_state_legged", self.joints_callback, 1)
+        self.publisher_heightmap = self.create_publisher(MarkerArray, "/height_scan_markers", 1)
+        self.create_timer(config["step_dt"], self.step)
+        self.get_logger().info(
+            f"{model}: {config['sensor_model']} on {topic} -> {rows}x{cols} heightmap on /height_scan_markers"
         )
-        # The decimated depth (32FC1, m), to look at it and record it.
-        self.publisher_depth = self.create_publisher(Image, "/depth_decimated", 1)
 
+    def lidar_callback(self, msg):
+        offsets = {field.name: field.offset for field in msg.fields}
+        data = np.frombuffer(msg.data, dtype=np.uint8).reshape(-1, msg.point_step)
+        points = np.stack([data[:, offsets[axis]:offsets[axis] + 4].copy().view(np.float32)[:, 0] for axis in "xyz"], axis=1)
+        # the L2 publishes at the end of its scan: time the message from its arrival, not from the robot's stamp
+        self.reconstructor.sensor_message(points, time.monotonic() - self.reconstructor.message_period)
+        self._sensor_arrived(f"the first LiDAR message ({len(points)} points)")
 
-    def get_depth_callback(self, msg):
-        """Decimate the RealSense depth (16UC1, mm) to the depth camera of the policy."""
-        factor = msg.width // self.depth_width
-        if msg.encoding != "16UC1" or factor < 1 or (msg.width, msg.height) != (factor * self.depth_width, factor * self.depth_height):
-            # Throttle the warnings, e.g. a camera launched with the decimation filter of the driver.
+    def depth_callback(self, msg):
+        if msg.encoding != "16UC1":
             now = time.monotonic()
-            if now - self._last_depth_warning_time >= 2.0:
-                self.get_logger().warning(
-                    f"Ignoring a {msg.width}x{msg.height} {msg.encoding} depth: expected 16UC1 at a multiple of "
-                    f"{self.depth_width}x{self.depth_height} (848x480, deploy/camera_connect.sh)"
-                )
-                self._last_depth_warning_time = now
+            if now - self._last_warning_time >= 2.0:
+                self.get_logger().warning(f"Ignoring a {msg.encoding} depth image: expected 16UC1 (mm)")
+                self._last_warning_time = now
             return
         depth = np.frombuffer(msg.data, dtype=np.uint16).reshape(msg.height, msg.step // 2)[:, :msg.width]
-        self.depth_image = decimate_depth(depth, factor)
+        self.reconstructor.sensor_message(depth.astype(np.float32) * 0.001, time.monotonic())
+        self._sensor_arrived(f"the first depth image ({msg.width}x{msg.height})")
 
-        depth_msg = Image()
-        depth_msg.header = msg.header
-        depth_msg.height, depth_msg.width = self.depth_image.shape
-        depth_msg.encoding = "32FC1"
-        depth_msg.step = 4 * depth_msg.width
-        depth_msg.data = self.depth_image.tobytes()
-        self.publisher_depth.publish(depth_msg)
+    def _sensor_arrived(self, what: str) -> None:
+        if not self.sensor_arrived:
+            self.get_logger().info(f"Received {what}")
+        self.sensor_arrived = True
 
-        if not self.first_message_depth_arrived:
-            self.get_logger().info(f"Received the first depth image ({msg.width}x{msg.height}, decimated by {factor})")
-        self.first_message_depth_arrived = True
+    def imu_callback(self, msg):
+        self.imu = (np.array(msg.angular_velocity), np.array(msg.orientation))
+
+    def joints_callback(self, msg):
+        self.joints = (np.array(msg.joints_position), np.array(msg.joints_velocity))
+
+    def step(self):
+        if self.imu is None or self.joints is None or not self.sensor_arrived:
+            return
+        angular_velocity, (x, y, z, w) = self.imu
+        projected_gravity = -np.array((2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)))  # -R^T z
+        heights = self.reconstructor.step(angular_velocity, projected_gravity, *self.joints, time.monotonic()).numpy()
+        # cells in base_link: the controller adds the base pose and takes their z
+        frame = lidar_grid.yaw_frame(torch.tensor(projected_gravity[None], dtype=torch.float32))[0].numpy()
+        points = np.column_stack((self.cells, -heights - lidar_grid.HEIGHT_OFFSET)) @ frame.T
+        stamp = self.get_clock().now().to_msg()
+        markers = MarkerArray()
+        for index, point in enumerate(points.tolist()):
+            marker = Marker()
+            marker.header.frame_id = "base_link"
+            marker.header.stamp = stamp
+            marker.ns = "height_scan"
+            marker.id = index
+            marker.type = Marker.SPHERE
+            marker.action = Marker.ADD
+            marker.pose.position.x, marker.pose.position.y, marker.pose.position.z = point
+            marker.pose.orientation.w = 1.0
+            marker.scale.x = marker.scale.y = marker.scale.z = 0.02
+            marker.color.b = marker.color.a = 1.0
+            markers.markers.append(marker)
+        self.publisher_heightmap.publish(markers)
 
 
-#---------------------------
-if __name__ == '__main__':
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--model", required=True, help="Reconstructor exported by deploy/terrain_reconstructor.py (.ts).")
+    parser.add_argument("--robot", default="go2", help="Robot, a module of robots/: the order of its joints.")
+    parser.add_argument("--topic", default=None, help="Sensor topic, if not the default of the sensor kind.")
+    args = parser.parse_args()
 
     rclpy.init()
-    depth_to_heightmap_ros2_node = DepthToHeightmapROS2()
-    rclpy.spin(depth_to_heightmap_ros2_node)
-
-    depth_to_heightmap_ros2_node.destroy_node()
+    node = Sensor2HeightmapROS2(args.model, args.robot, args.topic)
+    rclpy.spin(node)
+    node.destroy_node()
     rclpy.shutdown()
