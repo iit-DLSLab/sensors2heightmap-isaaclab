@@ -1,3 +1,5 @@
+"""Recurrent terrain reconstructor and its training."""
+
 from __future__ import annotations
 
 import argparse
@@ -72,11 +74,9 @@ class DepthTokenEncoder(nn.Module):
         )
 
     def encode_frames(self, frames: Tensor) -> Tensor:
-        """(N, C, H, W) -> token maps (N, D, h, w), each frame on its own."""
         return self.token_projection(self.token_pool(self.encoder(frames)))
 
     def token_maps(self, features: Tensor) -> Tensor:
-        """Features of ``encode_frames`` -> token maps of the fusion: the same here."""
         return features
 
     def on_heightmap(self, context: Tensor, heightmap_size: tuple[int, int]) -> Tensor:
@@ -84,16 +84,13 @@ class DepthTokenEncoder(nn.Module):
 
 
 class LidarGridEncoder(nn.Module):
-    """LiDAR grids (N, C, H, W) of 5 cm cells (l2_lidar_to_heightmap/lidar_grid.py) -> features (N, D, H / 2, W / 2)
-    of 10 cm cells centred on the heightmap's: the heightmap is a crop of them, from ``crop`` (row, col), so the
-    refiner gets the features of each cell's own ground."""
+    """Encodes the LiDAR grid into features on cells centred on the heightmap's."""
 
     def __init__(self, channels: int, embed_dim: int, token_grid_size: tuple[int, int], context_channels: int,
                  crop: tuple[int, int]):
         super().__init__()
         self.encoder = nn.Sequential(
             ConvNormAct(channels, 32, kernel_size=3, padding=1),
-            # each output cell sees 4 x 4 grid cells centred on 2 x 2 of them: a 10 cm cell
             ConvNormAct(32, 64, kernel_size=4, stride=2, padding=1),
             ConvNormAct(64, 96, kernel_size=3, padding=1),
             ConvNormAct(96, embed_dim, kernel_size=3, padding=1),
@@ -127,15 +124,9 @@ class ProprioceptiveEncoder(nn.Module):
             nn.Linear(hidden_dim, embed_dim),
         )
         self.output_norm = nn.LayerNorm(embed_dim)
-        # the sinusoidal position embedding of position 0 (cos 0 = 1 on the odd features), from when the models took a
-        # history of observations: trained weights expect it
-        position = torch.zeros(embed_dim)
-        position[1::2] = 1.0
-        self.register_buffer("position", position, persistent=False)
 
     def forward(self, proprio: Tensor) -> Tensor:
-        """(N, F) -> (N, D)"""
-        return self.output_norm(self.encoder(self.input_norm(proprio)) + self.position)
+        return self.output_norm(self.encoder(self.input_norm(proprio)))
 
 
 class ConditionalUNetRefiner(nn.Module):
@@ -161,8 +152,7 @@ class ConditionalUNetRefiner(nn.Module):
 
 
 def _encode_frames(encoder: nn.Module, frames: Tensor, chunk_size: int, checkpointed: bool) -> Tensor:
-    """Token maps of (N, C, H, W) frames, a chunk at a time. With ``checkpointed`` (training) only each chunk's input is
-    kept and its activations are recomputed in the backward pass: those of a few thousand frames do not fit in GPU memory."""
+    """Encodes frames in chunks, with gradient checkpointing when training."""
     chunks = frames.split(chunk_size)
     if checkpointed:
         return torch.cat([checkpoint(encoder.encode_frames, chunk, use_reentrant=False) for chunk in chunks])
@@ -170,14 +160,10 @@ def _encode_frames(encoder: nn.Module, frames: Tensor, chunk_size: int, checkpoi
 
 
 def _context_on_heightmap(context: Tensor, heightmap_size: tuple[int, int]) -> Tensor:
-    """Image-space context resampled onto the heightmap layout. Image rows = distance (top = far), image cols = lateral
-    (left -> right); heightmap rows = lateral (y from -0.4 = right to +0.4 = left), heightmap cols = distance (near to
-    far).
-    In a nutshell: IsaacLab heightmap format is the transpose of the frames format coming from the depth camera.
-    """
+    """Resamples image features onto the heightmap layout (rows along y, cols along x)."""
     n_y, n_x = heightmap_size
     context = F.interpolate(context, size=(n_x, n_y), mode="bilinear", align_corners=False)
-    return context.transpose(-1, -2).flip(-2, -1)  # (B, C, n_y, n_x), same layout as the heightmap
+    return context.transpose(-1, -2).flip(-2, -1)
 
 
 @dataclass
@@ -188,21 +174,12 @@ class TerrainReconstructionOutput:
 
 
 class RecurrentTerrainReconstructor(nn.Module):
-    """The terrain reconstructor: one control step at a time, with the GRU state carried across steps as its memory.
+    """At every step the sensor features and the proprioception go through an MLP into a GRU; the heightmap
+    is decoded from the GRU state and refined with the current sensor features.
 
-    A step takes the current depth frame and the current 'common' observation, nothing older. An MLP merges them into
-    the GRU input: the frame's token map (fewer channels) and the proprioceptive token, concatenated. The camera is
-    fixed to the body, so each map position always looks at about the same ground: fixed weights can do. The result
-    updates the GRU state, and the heightmap is decoded from the state, then refined with the current frame (in the
-    heightmap layout). Terrain seen earlier, e.g. the ground now under the robot's head, can only come from the state.
+    Inputs (B, L, C, H, W) and (B, L, F), outputs (B, L, 1, h, w)."""
 
-    Inputs are L consecutive steps of B robots, depth_data (B, L, C, H, W) and robot_info (B, L, F); the outputs are
-    (B, L, 1, h, w). On the robot L = 1 and ``hidden_state`` goes from one call to the next (None: start of an episode).
-    With ``sensor="lidar"`` depth_data are the grids of the latest LiDAR message (``LidarGridEncoder``) instead of the
-    depth frames.
-    """
-
-    frames_per_chunk = 256  # frames encoded at once
+    frames_per_chunk = 256
 
     def __init__(
         self,
@@ -215,24 +192,12 @@ class RecurrentTerrainReconstructor(nn.Module):
         token_grid_size: tuple[int, int] = (6, 8),
         refinement_context_channels: int = 32,
         refinement_base_channels: int = 32,
-        dropped_proprio_features: tuple[int, ...] = (),
-        removed_proprio_features: tuple[int, ...] = (),
         frame_channels: int = 16,
         sensor: str = "depth",
         context_crop: tuple[int, int] = (0, 0),
     ):
         super().__init__()
         self.heightmap_size = heightmap_size
-        # observation features left out of the network's input (the base linear velocity, which the robot has only as
-        # an estimate, and the velocity commands, which say nothing about the terrain); the models trained before
-        # 2026-11-02 zeroed them instead (dropped_proprio_features)
-        keep = torch.ones(proprio_dim)
-        keep[list(dropped_proprio_features)] = 0.0
-        self.register_buffer("proprio_keep", keep, persistent=False)
-        removed = set(removed_proprio_features)
-        self.register_buffer(
-            "proprio_index", torch.tensor([i for i in range(proprio_dim) if i not in removed]), persistent=False
-        )
         self.sensor = sensor
         if sensor == "depth":
             self.depth_encoder = DepthTokenEncoder(depth_channels, embed_dim, token_grid_size, refinement_context_channels)
@@ -242,7 +207,7 @@ class RecurrentTerrainReconstructor(nn.Module):
             )
         else:
             raise ValueError(f"Unknown sensor: {sensor}")
-        self.proprio_encoder = ProprioceptiveEncoder(len(self.proprio_index), embed_dim, proprio_hidden_dim)
+        self.proprio_encoder = ProprioceptiveEncoder(proprio_dim, embed_dim, proprio_hidden_dim)
         self.frame_reduction = nn.Conv2d(embed_dim, frame_channels, kernel_size=1)
         fused_dim = frame_channels * token_grid_size[0] * token_grid_size[1] + embed_dim
         self.step_mlp = nn.Sequential(
@@ -265,14 +230,12 @@ class RecurrentTerrainReconstructor(nn.Module):
         self, depth_data: Tensor, robot_info: Tensor, hidden_state: Tensor | None = None
     ) -> TerrainReconstructionOutput:
         batch_size, steps = robot_info.shape[:2]
-        proprio = (robot_info * self.proprio_keep)[..., self.proprio_index]
-
         encoder = self.depth_encoder if self.sensor == "depth" else self.lidar_encoder
         features = _encode_frames(
             encoder, depth_data.flatten(0, 1), self.frames_per_chunk, self.training and torch.is_grad_enabled()
         )
-        token_maps = encoder.token_maps(features)  # (B * L, D, h, w)
-        proprio_token = self.proprio_encoder(proprio.flatten(0, 1))  # (B * L, D)
+        token_maps = encoder.token_maps(features)
+        proprio_token = self.proprio_encoder(robot_info.flatten(0, 1))
         frame = self.frame_reduction(token_maps).flatten(1)
         step_input = self.step_mlp(torch.cat((frame, proprio_token), dim=1))
         memory, hidden_state = self.memory(step_input.view(batch_size, steps, -1), hidden_state)
@@ -287,72 +250,71 @@ class RecurrentTerrainReconstructor(nn.Module):
             hidden_state=hidden_state,
         )
 
-    def load_state_dict(self, state_dict, strict: bool = True, assign: bool = False):
-        # the checkpoints trained before the attention fusion was removed also hold the norm of its tokens
-        state_dict = {key: value for key, value in state_dict.items() if ".token_norm." not in key}
-        return super().load_state_dict(state_dict, strict, assign)
 
-
-# the modules of the fusion: --reinit_fusion starts them from random weights
 FUSION_MODULES = ("frame_reduction", "step_mlp")
 
 
 def build_terrain_reconstructor(model_config: dict) -> nn.Module:
-    """The model a checkpoint's ``model_config`` describes."""
-    config = dict(model_config)
-    config.pop("lidar_errors", None)  # the simulated L2's, not the model's
-    if config.pop("architecture", "window") != "recurrent":
-        raise ValueError("Window (transformer) checkpoints are no longer supported: only the recurrent model is.")
-    if config.pop("fusion", "attention") != "mlp":
-        raise ValueError("Attention-fusion checkpoints are no longer supported: only the MLP fusion is.")
-    return RecurrentTerrainReconstructor(**config)
+    return RecurrentTerrainReconstructor(**model_config)
 
 
-# The 'common' observation (locomotion_env._get_observations) stacks the last frames, oldest first, of 52 values: base
-# linear velocity 3, base angular velocity 3, projected gravity 3, velocity command 3, joint positions 12, joint
-# velocities 12, actions 12, gait clock 4.
-COMMON_OBS_FRAME = 52
-LINEAR_VELOCITY_FEATURES = range(0, 3)
-VELOCITY_COMMAND_FEATURES = range(9, 12)
+PROPRIO_NOISE_TERMS = ("base_ang_vel", "projected_gravity", "joint_pos", "joint_vel")
 
 
-def common_obs_features(proprio_dim: int, features: Sequence[int]) -> tuple[int, ...]:
-    """Positions of the given features (indices in a frame) in every frame of the 'common' observation."""
-    if proprio_dim % COMMON_OBS_FRAME:
-        raise ValueError(f"A 'common' observation has frames of {COMMON_OBS_FRAME} values, not {proprio_dim} in all.")
-    return tuple(frame * COMMON_OBS_FRAME + i for frame in range(proprio_dim // COMMON_OBS_FRAME) for i in features)
+class ProprioNoise:
+    """IMU and joint noise on a proprioception history: white noise per reading plus a bias, with the
+    task's observation_noise_std."""
+
+    def __init__(self, observation_noise_std: dict, num_joints: int, history: int):
+        sizes = (3, 3, num_joints, num_joints)
+        self.noise_std, self.bias_std = (
+            torch.tensor([observation_noise_std[term][i] for term, size in zip(PROPRIO_NOISE_TERMS, sizes) for _ in range(size)])
+            for i in (0, 1)
+        )
+        self.history = history
+
+    def __call__(self, proprio: Tensor, generator: torch.Generator | None = None) -> Tensor:
+        """Noise on consecutive steps, (B, L, F)."""
+        batch, steps = proprio.shape[:2]
+        frames = proprio.view(batch, steps, self.history, -1)
+        noise_std, bias_std = self.noise_std.to(proprio.device), self.bias_std.to(proprio.device)
+        readings = torch.randn(batch, steps + self.history - 1, frames.shape[-1], device=proprio.device, generator=generator)
+        noise = (readings * noise_std).unfold(1, self.history, 1).transpose(-1, -2)
+        bias = torch.randn(batch, 1, 1, frames.shape[-1], device=proprio.device, generator=generator) * bias_std
+        return (frames + (noise + bias) * (frames != 0).any(dim=-1, keepdim=True)).view_as(proprio)
+
+    def step(self, proprio: Tensor, restart: Tensor, state: dict | None, generator: torch.Generator | None = None):
+        """Noise on one step, state carries it to the next."""
+        frames = proprio.view(proprio.shape[0], self.history, -1)
+        noise_std, bias_std = self.noise_std.to(proprio.device), self.bias_std.to(proprio.device)
+        draw = lambda: torch.randn(frames.shape[0], frames.shape[-1], device=proprio.device, generator=generator)  # noqa: E731
+        if state is None:
+            state = {"readings": torch.zeros_like(frames), "bias": draw() * bias_std}
+        state["bias"] = torch.where(restart.view(-1, 1), draw() * bias_std, state["bias"])
+        state["readings"] = torch.cat((state["readings"][:, 1:], (draw() * noise_std)[:, None]), dim=1)
+        noisy = frames + (state["readings"] + state["bias"][:, None]) * (frames != 0).any(dim=-1, keepdim=True)
+        return noisy.view_as(proprio), state
 
 
-def _select_proprio_inputs(state: dict, init_config: dict, model_config: dict) -> dict:
-    """A trained model's weights with the proprioception encoder's input weights of the features this model keeps."""
+def task_proprio_noise(metadata: dict) -> ProprioNoise | None:
+    """ProprioNoise of the task the data come from (policy's env.yaml), or None."""
+    import yaml
 
-    def kept(config):
-        removed = set(config.get("removed_proprio_features", ()))
-        return [i for i in range(config["proprio_dim"]) if i not in removed]
-
-    init_kept, model_kept = kept(init_config), kept(model_config)
-    if init_kept == model_kept:
-        return state
-    if not set(model_kept) <= set(init_kept):
-        raise ValueError(f"The initial model has no input for features {sorted(set(model_kept) - set(init_kept))}")
-    columns = torch.tensor([init_kept.index(i) for i in model_kept])
-    state = dict(state)
-    for key in ("proprio_encoder.input_norm.weight", "proprio_encoder.input_norm.bias"):
-        state[key] = state[key][columns]
-    state["proprio_encoder.encoder.0.weight"] = state["proprio_encoder.encoder.0.weight"][:, columns]
-    return state
+    policy = Path(str(metadata.get("checkpoint_path", "")))
+    env_yaml = (policy.parent.parent if policy.parent.name == "exported" else policy.parent) / "params" / "env.yaml"
+    if not env_yaml.is_file():
+        return None
+    with open(env_yaml) as file:
+        observation_noise_std = yaml.unsafe_load(file)["observation_noise_std"]
+    return ProprioNoise(observation_noise_std, len(metadata["proprio_joint_names"]), metadata["proprio_history"])
 
 
-# The test metrics skip the first 49 steps (about 1 s) of every episode, as the window models of the first studies
-# needed: the numbers still compare with all the earlier results.
-TEST_WARMUP_STEPS = 49
+TEST_WARMUP_STEPS = 49  # the first second of each episode is not scored
 
 
 def compute_reconstruction_losses(
     prediction: TerrainReconstructionOutput, target_heightmap: Tensor, rough_loss_type: str = "mse"
 ) -> dict[str, Tensor]:
-    # With small-valued targets, MSE on the rough stage yields gradients far weaker than the L1 on the
-    # refined stage, so the rough decoder barely trains; "l1" gives both stages comparable gradients.
     if rough_loss_type == "l1":
         rough_loss = F.l1_loss(prediction.rough_heightmap, target_heightmap)
     elif rough_loss_type == "mse":
@@ -372,13 +334,7 @@ FRAME_KEYS = {"depth": "depth_data", "lidar": "lidar_grid"}
 
 
 class SequenceTerrainReconstructionDataset(Dataset):
-    """Segments cut from the sequences of collect_depth_to_heightmap.py (one directory of chunk files per run).
-
-    The chunks hold every step of every env once, time-major ``(steps, envs, ...)``, memory-mapped. A sample is
-    ``segment_length`` consecutive steps of one env, read on access: the depth frames ``(L, C, H, W)``, the 'common'
-    observations ``(L, F)`` and the target heightmaps ``(L, 1, h, w)``. No segment crosses a reset: all its steps must
-    have ``dones`` False, which also drops the reset step itself (its sensors may still show the previous episode).
-    """
+    """Segments of consecutive steps of one env, cut from the recordings, without resets inside."""
 
     def __init__(self, dataset_path: str | Sequence[str], segment_length: int = 1):
         super().__init__()
@@ -392,13 +348,12 @@ class SequenceTerrainReconstructionDataset(Dataset):
             if not paths:
                 raise FileNotFoundError(f"No chunk_*.pt files in {directory}")
             chunks = [torch.load(path, map_location="cpu", mmap=True, weights_only=True) for path in paths]
-            # the frames of the run's sensor: depth images or LiDAR grids (collector --sensor)
             frame_key = FRAME_KEYS[chunks[0]["metadata"].get("sensor", "depth")]
             if run == 0:
                 self.frame_key = frame_key
             elif frame_key != self.frame_key:
                 raise ValueError(f"{directory} has {frame_key}, the first run {self.frame_key}: one sensor per dataset.")
-            required_keys = {frame_key, "robot_info", "heightmaps", "dones"}
+            required_keys = {frame_key, "proprio", "heightmaps", "dones"}
             for path, chunk in zip(paths, chunks):
                 missing_keys = required_keys.difference(chunk)
                 if missing_keys:
@@ -409,7 +364,6 @@ class SequenceTerrainReconstructionDataset(Dataset):
                     raise ValueError(f"Chunks in {directory} are not consecutive: {paths}")
                 starts.append(starts[-1] + chunk["dones"].shape[0])
 
-            # resets[i] = number of resets in steps 0 .. i-1, so steps a .. b are clean if resets[b + 1] == resets[a]
             dones = torch.cat([chunk["dones"] for chunk in chunks])
             resets = torch.cat([torch.zeros(1, dones.shape[1], dtype=torch.long), dones.long().cumsum(dim=0)])
             first = torch.arange(dones.shape[0] - segment_length + 1)
@@ -417,14 +371,12 @@ class SequenceTerrainReconstructionDataset(Dataset):
             sample_steps, sample_envs = clean.nonzero(as_tuple=True)
             sample_steps = first[sample_steps]
             index.append(torch.stack((torch.full_like(sample_steps, run), sample_steps, sample_envs), dim=1))
-            # target at the last step of each sample: target statistics and baselines
             all_targets = torch.cat([chunk["heightmaps"] for chunk in chunks])
             targets.append(all_targets[sample_steps + segment_length - 1, sample_envs].float())
             self.runs.append({"chunks": chunks, "starts": starts, "resets": resets})
 
         self.index = torch.cat(index)
         self.heightmaps = torch.cat(targets)
-        # one id per (run, env): consecutive steps are near duplicates, so hold out whole envs for validation
         self.env_ids = self.index[:, 0] * 1_000_000 + self.index[:, 2]
         metadata = self.runs[0]["chunks"][0]["metadata"]
         self.metadata = {
@@ -433,12 +385,10 @@ class SequenceTerrainReconstructionDataset(Dataset):
             "dataset_directories": [str(directory) for directory in directories],
             "segment_length": segment_length,
         }
-        # velocity commands of the recordings (runs collected before the option existed used the default ones)
         commands = {run["chunks"][0]["metadata"].get("commands", "default") for run in self.runs}
         self.metadata["commands"] = commands.pop() if len(commands) == 1 else "mixed"
 
     def _rows(self, run: int, name: str, start: int, stop: int, env: int) -> Tensor:
-        """Steps start .. stop-1 of one env, across chunk boundaries."""
         chunks, starts = self.runs[run]["chunks"], self.runs[run]["starts"]
         parts = []
         chunk = bisect.bisect_right(starts, start) - 1
@@ -449,7 +399,6 @@ class SequenceTerrainReconstructionDataset(Dataset):
         return parts[0] if len(parts) == 1 else torch.cat(parts)
 
     def step_rows(self, run: int, name: str, step: int) -> Tensor:
-        """One step of every env of a run: (envs, ...)."""
         chunks, starts = self.runs[run]["chunks"], self.runs[run]["starts"]
         chunk = bisect.bisect_right(starts, step) - 1
         return chunks[chunk][name][step - starts[chunk]]
@@ -460,12 +409,11 @@ class SequenceTerrainReconstructionDataset(Dataset):
     def __getitem__(self, index: int) -> tuple[Tensor, Tensor, Tensor]:
         run, first, env = self.index[index].tolist()
         stop = first + self.segment_length
-        return tuple(self._rows(run, name, first, stop, env).float() for name in (self.frame_key, "robot_info", "heightmaps"))
+        return tuple(self._rows(run, name, first, stop, env).float() for name in (self.frame_key, "proprio", "heightmaps"))
 
 
 def _segment_prediction(model: nn.Module, depth_data: Tensor, robot_info: Tensor, burn_in: int = 0) -> TerrainReconstructionOutput:
-    """Outputs on steps burn_in .. L-1 of a batch of segments. The burn-in steps only warm up the memory (no loss, no
-    gradient)."""
+    """Prediction on segments, the first burn_in steps only warm up the memory."""
     if burn_in == 0:
         return model(depth_data=depth_data, robot_info=robot_info)
     with torch.no_grad():
@@ -483,12 +431,11 @@ def _run_epoch(
     rough_loss_type: str = "mse",
     burn_in: int = 0,
     max_grad_norm: float | None = None,
+    proprio_noise: ProprioNoise | None = None,
 ) -> dict[str, float]:
-    """Run one epoch. Losses are computed on normalized targets ``(target - target_mean) / target_std``;
-    ``refined_mae_m`` reports the refined error back in metres. Batches of segments are scored on the steps after
-    ``burn_in``, with truncated backpropagation through time over those steps."""
     is_training = optimizer is not None
     model.train(mode=is_training)
+    generator = None if is_training else torch.Generator(device).manual_seed(0)
 
     total_loss = 0.0
     total_rough_loss = 0.0
@@ -499,6 +446,8 @@ def _run_epoch(
     for batch in progress:
         depth_data = batch[0].to(device)
         robot_info = batch[1].to(device)
+        if proprio_noise is not None:
+            robot_info = proprio_noise(robot_info, generator)
         target_heightmap = (batch[2].to(device) - target_mean) / target_std
 
         if is_training:
@@ -517,7 +466,7 @@ def _run_epoch(
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
             optimizer.step()
 
-        batch_size = target_heightmap.numel() // target_heightmap.shape[-3:].numel()  # heightmaps scored
+        batch_size = target_heightmap.numel() // target_heightmap.shape[-3:].numel()
         total_samples += batch_size
         total_loss += losses["loss"].item() * batch_size
         total_rough_loss += losses["rough_loss"].item() * batch_size
@@ -550,10 +499,9 @@ def train_terrain_reconstructor(
     max_grad_norm: float | None = None,
     resume_path: str | Path | None = None,
     resume_info: dict | None = None,
+    proprio_noise: ProprioNoise | None = None,
 ) -> list[dict[str, float]]:
-    """Train the reconstructor. With ``restore_best`` and a validation loader, the model ends with the weights
-    of the epoch with the lowest validation refined loss instead of the last epoch. With ``resume_path`` the training
-    state is saved there after every epoch (with ``resume_info``), and an existing file is continued from."""
+    """Training loop: cosine LR, best epoch restored, resumable."""
     device = torch.device(device)
     model.to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
@@ -569,13 +517,13 @@ def train_terrain_reconstructor(
         rough_loss_type=rough_loss_type,
         burn_in=burn_in,
         max_grad_norm=max_grad_norm,
+        proprio_noise=proprio_noise,
     )
 
     best_val_loss = float("inf")
     best_state: dict[str, Tensor] | None = None
     history: list[dict[str, float]] = []
     if resume_path is not None and os.path.exists(resume_path):
-        # an interrupted training: continue after its last finished epoch
         resume = torch.load(resume_path, map_location="cpu", weights_only=False)
         model.load_state_dict(resume["model"])
         optimizer.load_state_dict(resume["optimizer"])
@@ -644,7 +592,7 @@ def train_terrain_reconstructor(
                 "info": resume_info,
             }
             torch.save(state, f"{resume_path}.tmp")
-            os.replace(f"{resume_path}.tmp", resume_path)  # never leave a half-written file
+            os.replace(f"{resume_path}.tmp", resume_path)
 
     if best_state is not None:
         model.load_state_dict(best_state)
@@ -661,7 +609,7 @@ def run_terrain_reconstruction(
     num_epochs: int = 100,
     model_path: str | None = None,
     use_wandb: bool = False,
-    wandb_project: str = "go2-locomotion",
+    wandb_project: str = "sensors2heightmap",
     run_name: str | None = None,
     num_workers: int = 0,
     test_dataset_path: str | Sequence[str] | None = None,
@@ -671,15 +619,13 @@ def run_terrain_reconstruction(
     max_val_samples: int | None = None,
     init_checkpoint: str | None = None,
     learning_rate: float = 3e-4,
-    drop_velocity_commands: bool = True,
-    drop_linear_velocity: bool = True,
     reinit_fusion: bool = False,
+    proprio_noise: bool = False,
 ) -> None:
     dataset_paths = [Path(p).expanduser().resolve() for p in ([path] if isinstance(path, (str, Path)) else path)]
     for dataset_path in dataset_paths:
         if not dataset_path.is_dir():
             raise FileNotFoundError(f"Not a sequence directory: {dataset_path}")
-    # the first directory sets the default output location; several are trained on as one dataset
     dataset_path = dataset_paths[0]
     dataset_path_record = str(dataset_path) if len(dataset_paths) == 1 else [str(p) for p in dataset_paths]
     if segment_length < 2:
@@ -689,18 +635,15 @@ def run_terrain_reconstruction(
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
     dataset = SequenceTerrainReconstructionDataset([str(p) for p in dataset_paths], segment_length)
-    # consecutive steps are near duplicates: validate on whole envs never seen in training
     is_valid = dataset.env_ids % 5 == 4
     train_ids, valid_ids = (~is_valid).nonzero().flatten(), is_valid.nonzero().flatten()
     if max_val_samples and len(valid_ids) > max_val_samples:
-        # overlapping segments of the same envs: a fixed random subset ranks the epochs just as well
         subset = torch.randperm(len(valid_ids), generator=torch.Generator().manual_seed(0))[:max_val_samples]
         valid_ids = valid_ids[subset.sort().values]
     train_dataset = Subset(dataset, train_ids.tolist())
     valid_dataset = Subset(dataset, valid_ids.tolist())
     train_size, val_size = len(train_dataset), len(valid_dataset)
     loader_kwargs = {"num_workers": num_workers, "persistent_workers": num_workers > 0}
-    # an epoch of samples_per_epoch random segments (all of them if None), different ones every epoch
     train_sampler = RandomSampler(train_dataset, num_samples=samples_per_epoch) if samples_per_epoch else None
     train_loader = DataLoader(
         train_dataset, batch_size=batch_size, shuffle=train_sampler is None, sampler=train_sampler, **loader_kwargs
@@ -712,24 +655,15 @@ def run_terrain_reconstruction(
         "proprio_dim": sample_robot_info.shape[-1],
         "depth_channels": sample_depth.shape[-3],
         "heightmap_size": tuple(sample_target.shape[-2:]),
-        "architecture": "recurrent",
-        "fusion": "mlp",
-        "sensor": dataset.metadata.get("sensor", "depth"),
+        "sensor": dataset.metadata["sensor"],
     }
     if model_config["sensor"] == "lidar":
-        # the 10 cm cells of the grid, all as tokens, and where the heightmap sits among them
         model_config["token_grid_size"] = tuple(size // 2 for size in sample_depth.shape[-2:])
-        model_config["context_crop"] = tuple(dataset.metadata["lidar_heightmap_crop"])
-        # the extra L2 errors of the training data, also in the closed loop (sim_helpers.SensorFrames)
-        model_config["lidar_errors"] = dict(dataset.metadata.get("lidar_errors", {}))
-    removed = []
-    if drop_linear_velocity:
-        removed += LINEAR_VELOCITY_FEATURES
-    if drop_velocity_commands:
-        removed += VELOCITY_COMMAND_FEATURES
-    if removed:
-        model_config["removed_proprio_features"] = common_obs_features(model_config["proprio_dim"], removed)
+        model_config["context_crop"] = tuple(dataset.metadata["lidar_grid"]["crop"])
 
+    noise = task_proprio_noise(dataset.metadata)
+    if proprio_noise and noise is None:
+        raise FileNotFoundError("--proprio_noise needs the policy's params/env.yaml (checkpoint_path of the data).")
     train_heightmaps = dataset.heightmaps[train_dataset.indices]
     target_normalization = {
         "mean": train_heightmaps.mean().item(),
@@ -737,20 +671,16 @@ def run_terrain_reconstruction(
     }
     model = build_terrain_reconstructor(model_config)
     if init_checkpoint:
-        # continue from a trained model: its weights and its normalization, so its outputs keep their meaning; with
-        # --reinit_fusion the fusion starts from random weights
         init = torch.load(init_checkpoint, map_location="cpu", weights_only=False)
         target_normalization = init["target_normalization"]
         init_state = init["model_state_dict"]
         if reinit_fusion:
             init_state = {key: value for key, value in init_state.items() if not key.startswith(FUSION_MODULES)}
-        init_state = _select_proprio_inputs(init_state, init["model_config"], model_config)
         missing, unexpected = model.load_state_dict(init_state, strict=False)
         if unexpected or any(not key.startswith(FUSION_MODULES) for key in missing):
             raise ValueError(f"{init_checkpoint} does not match the model: missing {missing}, unexpected {unexpected}")
         new = sorted({key.split(".")[0] for key in missing})
         print(f"[INFO] Initialised from {init_checkpoint}" + (f", new: {', '.join(new)}" if new else ""))
-    # MAE of always predicting the per-cell train mean: the model must beat this to be useful.
     baseline_mae = (dataset.heightmaps[valid_dataset.indices] - train_heightmaps.mean(dim=0, keepdim=True)).abs().mean().item()
     print(
         f"[INFO] Target normalization: mean={target_normalization['mean']:.4f} m, std={target_normalization['std']:.4f} m | "
@@ -767,10 +697,10 @@ def run_terrain_reconstruction(
 
     output_path = Path(model_path) if model_path else dataset_path.with_name("terrain_reconstructor.pt")
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    # training state after every epoch: rerunning the same command after an interruption continues from it
     resume_path = output_path.with_suffix(".resume.pt")
     run_setup = {"model_config": model_config, "train_settings": train_settings, "num_epochs": num_epochs,
-                 "batch_size": batch_size, "samples_per_epoch": samples_per_epoch, "dataset_path": dataset_path_record}
+                 "batch_size": batch_size, "samples_per_epoch": samples_per_epoch, "dataset_path": dataset_path_record,
+                 "proprio_noise": proprio_noise}
     resume_info = {"setup": run_setup}
     if resume_path.exists():
         previous = torch.load(resume_path, map_location="cpu", weights_only=False)["info"]
@@ -799,6 +729,7 @@ def run_terrain_reconstruction(
                 "samples_per_epoch": samples_per_epoch or train_size,
                 "init_checkpoint": init_checkpoint,
                 "reinit_fusion": reinit_fusion,
+                "proprio_noise": proprio_noise,
                 "dataset_path": dataset_path_record,
                 "target_mean": target_normalization["mean"],
                 "target_std": target_normalization["std"],
@@ -810,7 +741,6 @@ def run_terrain_reconstruction(
         resume_info["wandb_id"] = wandb_run.id
 
         def epoch_callback(metrics: dict[str, float]) -> None:
-            # "train_rough_loss" -> "train/rough_loss", "val_loss" -> "val/loss"
             logged = {key.replace("_", "/", 1): value for key, value in metrics.items() if key != "epoch"}
             if "val_refined_mae_m" in metrics:
                 logged["val/refined_mae_over_baseline"] = metrics["val_refined_mae_m"] / max(baseline_mae, 1e-12)
@@ -827,12 +757,11 @@ def run_terrain_reconstruction(
         target_std=target_normalization["std"],
         resume_path=resume_path,
         resume_info=resume_info,
+        proprio_noise=noise if proprio_noise else None,
         **train_settings,
     )
     best_metrics = min(history, key=lambda metrics: metrics["val_refined_loss"])
 
-    # Independent test set (other seed: new terrain and trajectories), step by step through the recorded episodes as
-    # on the robot, the memory carried across steps. The validation split shares nearby steps with training.
     test_metrics = {}
     if test_dataset_path:
         test_dataset = SequenceTerrainReconstructionDataset(test_dataset_path)
@@ -849,12 +778,19 @@ def run_terrain_reconstruction(
         if age_metrics:
             print("[INFO] Test MAE by memory age (steps) | " + " | ".join(
                 f"{key[len('test/mae_age'):-2]}: {value * 1000:.2f} mm" for key, value in age_metrics))
+        if noise is not None:
+            noisy = _predict_rollouts(model, test_dataset, device, target_normalization, TEST_WARMUP_STEPS, noise)
+            error = (noisy["refined"] - noisy["target"]).abs()
+            non_flat = noisy["target"].flatten(1).std(dim=1) >= NON_FLAT_STD_THRESHOLD_M
+            test_metrics["test/noisy_proprio_mae_m"] = error.mean().item()
+            test_metrics["test/noisy_proprio_non_flat_mae_m"] = error[non_flat].mean().item()
+            print(f"[INFO] Test MAE with the robot's proprioception noise {error.mean().item() * 1000:.2f} mm "
+                  f"(non-flat {error[non_flat].mean().item() * 1000:.2f})")
 
     torch.save(
         {
             "model_state_dict": {name: parameter.detach().cpu() for name, parameter in model.state_dict().items()},
             "model_config": model_config,
-            # The model predicts normalized heights: heightmap_m = prediction * std + mean.
             "target_normalization": target_normalization,
             "train_settings": train_settings,
             "best_epoch": int(best_metrics["epoch"]),
@@ -864,18 +800,17 @@ def run_terrain_reconstruction(
             "test_dataset_path": test_dataset_path,
             "init_checkpoint": init_checkpoint,
             "reinit_fusion": reinit_fusion,
+            "proprio_noise": proprio_noise,
             "test_metrics": test_metrics,
         },
         output_path,
     )
-    resume_path.unlink(missing_ok=True)  # the training is complete: a rerun must start over, not resume
+    resume_path.unlink(missing_ok=True)
     print(
         f"[INFO] Saved the terrain reconstructor (best epoch {int(best_metrics['epoch'])}, "
         f"val MAE {best_metrics['val_refined_mae_m'] * 1000:.2f} mm vs baseline {baseline_mae * 1000:.2f} mm) to: {output_path}"
     )
 
-    # Split the validation error by terrain type: flat samples dominate the dataset and hide how the model
-    # does on actual terrain.
     val_predictions = _predict(model, valid_loader, device, target_normalization, burn_in)
     val_target, val_prediction = val_predictions["target"], val_predictions["refined"]
     non_flat = val_target.flatten(1).std(dim=1) >= NON_FLAT_STD_THRESHOLD_M
@@ -909,21 +844,16 @@ def run_terrain_reconstruction(
         wandb_run.finish()
 
 
-# A heightmap whose cell heights vary by at least this much (standard deviation) counts as actual terrain.
-NON_FLAT_STD_THRESHOLD_M = 0.01
+NON_FLAT_STD_THRESHOLD_M = 0.01  # a heightmap with a larger std counts as terrain
 
 
 def heightmap_error_summary(ground_error: Tensor) -> dict[str, float]:
-    """A few numbers for a set of predicted heightmaps. ``ground_error`` is (steps, rows, cols): predicted minus true
-    ground height in metres (> 0 = ground drawn too high, a drop that is missed). Columns run along x ahead of the base;
-    the first three (x <= 0.3 m) are not in the current image of the D435 camera."""
+    """Error statistics of predicted heightmaps (predicted minus true ground height)."""
     error = ground_error.abs()
     per_step_off = (error > 0.05).flatten(1).any(dim=1)
     return {
         "steps": int(error.shape[0]),
         "mae_mm": error.mean().item() * 1000,
-        "mae_near_x_le_0.3m_mm": error[..., :3].mean().item() * 1000,
-        "mae_far_x_ge_0.4m_mm": error[..., 3:].mean().item() * 1000,
         "cells_within_1cm_pct": (error < 0.01).float().mean().item() * 100,
         "cells_within_3cm_pct": (error < 0.03).float().mean().item() * 100,
         "cells_too_high_5cm_pct": (ground_error > 0.05).float().mean().item() * 100,
@@ -932,17 +862,11 @@ def heightmap_error_summary(ground_error: Tensor) -> dict[str, float]:
     }
 
 
-# memory age bins (steps the memory across steps had already seen) for the rollout test metrics
 MEMORY_AGE_BINS = ((0, 10), (10, 25), (25, 50), (50, 100), (100, 200), (200, 100_000))
 
 
 def _evaluate_refiner_breakdown(model: nn.Module, predict: Callable[[], dict[str, Tensor]]) -> dict[str, float]:
-    """Test metrics in metres, plus how much the refiner adds and how much of it comes from the depth image.
-
-    ``predict`` returns the rough and refined predictions and the targets in metres (``_predict_rollouts``). Two passes: the model as trained (collecting the mean image context), then again with the
-    image context of every sample replaced by that mean, so the refiner keeps its input statistics but loses the
-    sample-specific image.
-    """
+    """Test metrics, and how much of the refiner's gain comes from the sensor input."""
     state = {"use_mean": False, "sum": 0.0, "count": 0}
 
     def context_hook(module, inputs, output):
@@ -975,7 +899,6 @@ def _evaluate_refiner_breakdown(model: nn.Module, predict: Callable[[], dict[str
         "test/refiner_image_gain_m": mean_context_mae - error.mean().item(),
         "test/samples": int(len(target)),
     }
-    # non-flat error per heightmap column (x ahead of the base); the near columns are the ones the camera cannot see
     if non_flat.any():
         for column, column_error in enumerate(error[non_flat].mean(dim=(0, 1)).tolist()):
             metrics[f"test/non_flat_mae_col{column}_m"] = column_error
@@ -994,8 +917,6 @@ def _predict(
     target_normalization: dict[str, float],
     burn_in: int = 0,
 ) -> dict[str, Tensor]:
-    """Rough and refined predictions and targets in metres, (N, h, w), for every step after ``burn_in`` of the
-    loader's segments."""
     mean, std = target_normalization["mean"], target_normalization["std"]
     outputs = {"rough": [], "refined": [], "target": []}
     model.eval()
@@ -1016,31 +937,30 @@ def _predict_rollouts(
     device: str | torch.device,
     target_normalization: dict[str, float],
     min_age: int = 0,
+    proprio_noise: ProprioNoise | None = None,
 ) -> dict[str, Tensor]:
-    """Predictions through every recorded step in order, as on the robot: all envs of a run at once, the memory carried
-    from one step to the next and restarted after each reset (the reset step itself is skipped, as in training).
-
-    Returns rough, refined and target in metres (N, h, w), with their run, step, env and memory age (N,): the number of
-    steps of the episode the memory had already seen, 0 at its restart. Only steps of age ``min_age`` or more.
-    """
+    """Runs the model through the recordings step by step, as on the robot."""
     mean, std = target_normalization["mean"], target_normalization["std"]
     outputs = {key: [] for key in ("rough", "refined", "target", "run", "step", "env", "age")}
     model.eval()
     with torch.no_grad():
         for run, record in enumerate(dataset.runs):
             resets = record["resets"]
-            robot_info = torch.cat([chunk["robot_info"] for chunk in record["chunks"]]).to(device)  # (steps, envs, F)
+            robot_info = torch.cat([chunk["proprio"] for chunk in record["chunks"]]).to(device)
             age = torch.full((resets.shape[1],), -1)
-            hidden_state = None
+            hidden_state, noise_state, generator = None, None, torch.Generator(device).manual_seed(run)
             for step in range(resets.shape[0] - 1):
-                clean = resets[step + 1] == resets[step]  # no reset at this step
+                clean = resets[step + 1] == resets[step]
                 age = torch.where(clean, age + 1, -1)
                 if hidden_state is not None:
                     restart = (age == 0).to(device).view(1, -1, 1)
                     hidden_state = torch.where(restart, torch.zeros_like(hidden_state), hidden_state)
+                proprio = robot_info[step].float()
+                if proprio_noise is not None:
+                    proprio, noise_state = proprio_noise.step(proprio, (age <= 0).to(device), noise_state, generator)
                 prediction = model(
                     depth_data=dataset.step_rows(run, dataset.frame_key, step).to(device)[:, None].float(),
-                    robot_info=robot_info[step, :, None].float(),
+                    robot_info=proprio[:, None],
                     hidden_state=hidden_state,
                 )
                 hidden_state = prediction.hidden_state
@@ -1065,11 +985,7 @@ def _heightmap_comparison_figure(
     error_scale_mm: float = 30.0,
     min_height_span_mm: float = 20.0,
 ):
-    """Plot target / prediction / |error| in millimetres for a few non-flat samples plus a flat reference.
-
-    Target and prediction share a colour scale per row, spanning at least ``min_height_span_mm``; the error uses
-    the same fixed scale in every row, so rows can be compared at a glance.
-    """
+    """Target / prediction / error figure for wandb."""
     import matplotlib
 
     matplotlib.use("Agg")
@@ -1091,8 +1007,6 @@ def _heightmap_comparison_figure(
         target_map, predicted_map = target[sample_id] * 1000, prediction[sample_id] * 1000
         vmin = min(target_map.min().item(), predicted_map.min().item())
         vmax = max(target_map.max().item(), predicted_map.max().item())
-        # Enforce a minimum colour span: otherwise sub-millimetre noise on flat samples is stretched over the
-        # whole colormap and looks like real terrain.
         if vmax - vmin < min_height_span_mm:
             center = 0.5 * (vmax + vmin)
             vmin, vmax = center - 0.5 * min_height_span_mm, center + 0.5 * min_height_span_mm
@@ -1116,15 +1030,15 @@ def _heightmap_comparison_figure(
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Train the terrain reconstructor (one depth frame and one observation per step, GRU memory). The "
-        "defaults are the recipe of the reference model (MLP fusion)."
+        description="Train the terrain reconstructor (one sensor input and the proprioception per step, GRU memory). "
+        "The defaults are the recipe of the reference model."
     )
     parser.add_argument(
         "--dataset_path",
         type=str,
         nargs="+",
         required=True,
-        help="Sequence directories written by collect_depth_to_heightmap.py (chunk_*.pt), trained on as one dataset.",
+        help="Sequence directories written by collect_sensors2heightmap.py (chunk_*.pt), trained on as one dataset.",
     )
     parser.add_argument(
         "--test_dataset_path",
@@ -1146,20 +1060,14 @@ def _parse_args() -> argparse.Namespace:
         help="Start from this trained model (weights and normalization).",
     )
     parser.add_argument(
+        "--proprio_noise",
+        action="store_true",
+        help="Noisy proprioception in training, as the robot's readings (the task's observation_noise_std).",
+    )
+    parser.add_argument(
         "--reinit_fusion",
         action="store_true",
         help="With --init_checkpoint: the fusion MLP starts from random weights.",
-    )
-    parser.add_argument(
-        "--keep_velocity_commands",
-        action="store_true",
-        help="Keep the velocity commands in the network's input (by default removed: they say nothing about the terrain).",
-    )
-    parser.add_argument(
-        "--keep_linear_velocity",
-        action="store_true",
-        help="Keep the base linear velocity in the network's input (by default removed: the simulator gives it exactly, the "
-        "robot only through a state estimator).",
     )
     parser.add_argument("--epochs", type=int, default=100, help="Number of training epochs.")
     parser.add_argument("--batch_size", type=int, default=32, help="Segments per batch.")
@@ -1175,7 +1083,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--num_workers", type=int, default=6, help="DataLoader worker processes that read samples from disk.")
     parser.add_argument("--device", type=str, default=None, help="Training device. Defaults to cuda if available.")
     parser.add_argument("--wandb", action="store_true", help="Log training metrics to Weights & Biases.")
-    parser.add_argument("--wandb_project", type=str, default="go2-locomotion", help="W&B project name.")
+    parser.add_argument("--wandb_project", type=str, default="sensors2heightmap", help="W&B project name.")
     parser.add_argument("--run_name", type=str, default=None, help="W&B run name.")
     return parser.parse_args()
 
@@ -1211,7 +1119,6 @@ if __name__ == "__main__":
         max_val_samples=args.max_val_samples,
         init_checkpoint=args.init_checkpoint,
         learning_rate=args.learning_rate,
-        drop_velocity_commands=not args.keep_velocity_commands,
-        drop_linear_velocity=not args.keep_linear_velocity,
         reinit_fusion=args.reinit_fusion,
+        proprio_noise=args.proprio_noise,
     )

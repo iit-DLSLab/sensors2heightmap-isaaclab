@@ -1,21 +1,9 @@
 # Copyright (c) 2022-2025, The Isaac Lab Project Developers (https://github.com/isaac-sim/IsaacLab/blob/main/CONTRIBUTORS.md).
 # All rights reserved.
-#
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Run a trained depth terrain reconstructor online and display its heightmap with Isaac Lab markers.
+"""Draws the reconstructed heightmap of a walking robot, optionally recording a video."""
 
-The locomotion policy walks and at every step the model gets the inputs it was trained on: the current depth frame and
-'common' observation, with its memory carried from the previous step (restarted after each reset). The predicted heightmap is drawn as tiles, one per cell at its predicted height, coloured by the error
-against the height scanner: green = close; yellow / orange / red = ground drawn too high (a drop is missed); cyan /
-blue / purple = drawn too low. With --draw spheres it is drawn alone instead, as blue spheres at the predicted height.
---show_ground_truth adds small white dots at the true ground. The depth camera is set up as in the checkpoint's data. With --closed_loop the visualized robot's policy walks on the
-predicted heightmap instead of the true one. With --record the viewport, following the robot, is written to a video
-plus a contact sheet of every --snapshot_interval-th frame, which also works without a display; a few error numbers of
-the run are appended to <video dir>/metrics.csv.
-"""
-
-"""Launch Isaac Sim Simulator first."""
 
 import argparse
 import sys
@@ -23,8 +11,7 @@ from pathlib import Path
 
 from isaaclab.app import AppLauncher
 
-# cli_args, sim_helpers and the terrain reconstructor are in train/, one folder up
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "train"))
 import cli_args  # isort: skip
 
 
@@ -51,12 +38,12 @@ parser.add_argument(
 parser.add_argument(
     "--show_depth_rays",
     action="store_true",
-    help="Keep the depth camera's ray-hit debug visualization (red): shows which ground the camera sees.",
+    help="The ray-hit debug visualization of the sensor (depth camera or LiDAR): shows which ground it sees.",
 )
 parser.add_argument(
     "--closed_loop",
     action="store_true",
-    help="The visualized robot's policy walks on the predicted heightmap (observation noise off) instead of the true one.",
+    help="The policy walks on the predicted heightmap (observation noise off).",
 )
 parser.add_argument("--metrics_interval", type=int, default=50, help="Print the MAE every N steps. 0 disables it.")
 parser.add_argument("--max_steps", type=int, default=0, help="Stop after N simulation steps. 0 runs indefinitely.")
@@ -85,7 +72,6 @@ sys.argv = [sys.argv[0]] + hydra_args
 app_launcher = AppLauncher(args_cli)
 simulation_app = app_launcher.app
 
-"""Rest everything follows."""
 
 import importlib.metadata as metadata
 import time
@@ -105,7 +91,6 @@ from terrain_reconstruction_mlp import build_terrain_reconstructor, heightmap_er
 
 
 def _annotate(frame, lines: list[str]):
-    """Write text lines on the top left of a BGR frame, white on a dark band."""
     import cv2
 
     for row, text in enumerate(lines):
@@ -117,7 +102,6 @@ def _annotate(frame, lines: list[str]):
 
 @hydra_task_config(args_cli.task, args_cli.agent)
 def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
-    """Run locomotion, terrain inference and marker visualization."""
     model_path = Path(args_cli.terrain_model_path).expanduser().resolve()
     checkpoint = torch.load(model_path, map_location="cpu", weights_only=False)
     terrain_model = build_terrain_reconstructor(checkpoint["model_config"])
@@ -130,17 +114,15 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     env_cfg.scene.num_envs = args_cli.num_envs
     env_cfg.seed = agent_cfg.seed
     env_cfg.sim.device = args_cli.device if args_cli.device is not None else env_cfg.sim.device
-    sim_helpers.configure_from_checkpoint(env_cfg, model_metadata)
+    sim_helpers.configure_from_checkpoint(args_cli.task, model_metadata, debug_vis=args_cli.show_depth_rays)
     env_cfg.perceptive_height_scanner.debug_vis = False
-    env_cfg.depth_camera.debug_vis = env_cfg.unitree_l2_lidar.debug_vis = args_cli.show_depth_rays
     if args_cli.closed_loop:
-        env_cfg.observation_noise_model = None  # the policy gets the predicted map as it is
+        env_cfg.observation_noise_model = None
 
     video_dir = Path(args_cli.video_dir or model_path.parent / "videos")
     if args_cli.record:
         from isaaclab_visualizers.kit import KitVisualizerCfg
 
-        # chase view: behind and to the right of the robot, looking at the heightmap in front of it
         env_cfg.sim.visualizer_cfgs = [
             KitVisualizerCfg(
                 eye=(-1.3, -1.3, 0.9),
@@ -158,8 +140,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     print(f"[INFO] Loading terrain model: {model_path}")
     print(f"[INFO] Loading locomotion policy: {policy_checkpoint}")
     print(
-        f"[INFO] Inputs: one depth frame and one observation per step, memory restarted after each reset, "
-        f"{checkpoint['model_config'].get('fusion', 'attention')} fusion, commands: {'forward only' if env_cfg.forward_commands else 'default'}, "
+        f"[INFO] Inputs: {model_metadata['sensor_model']} and proprioception, one per step, memory restarted after each "
+        f"reset, commands: {model_metadata.get('commands', 'default')}, "
         f"policy walks on the {'predicted' if args_cli.closed_loop else 'true'} heightmap"
     )
     print(f"[INFO] Marker colors: {legend}")
@@ -173,20 +155,17 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     device = env.unwrapped.device
     terrain_model.to(device).eval()
     surface = sim_helpers.HeightmapSurface(show_ground_truth=args_cli.show_ground_truth, mode=args_cli.draw)
-    sensor_frames = sim_helpers.SensorFrames(env, checkpoint["model_config"])
+    inputs = sim_helpers.ReconstructorInputs.from_metadata(env, model_metadata)
     surface.set_visibility(False)
 
-    # clean_steps counts the visualized env's steps since its last reset
     env_id = args_cli.visualized_env
     clean_steps = 0
     hidden_state = None
-    predicted = None  # the latest prediction, for the policy with --closed_loop
+    predicted = None
     errors: list[torch.Tensor] = []
     obs = env.get_observations()
     map_slice = sim_helpers.heightmap_slice(obs, env)
     step_dt = float(env.unwrapped.step_dt)
-    # frames are grabbed from the Kit viewport and written with OpenCV (Isaac Lab's recorder needs MoviePy); the
-    # OpenCV of Isaac Sim only has its built-in MJPG encoder, hence .avi
     viewport = None
     video_writer = None
     frames_written = 0
@@ -201,8 +180,6 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         import omni.usd
         from pxr import UsdGeom
 
-        # several envs can share a terrain tile and walk through each other: show only the visualized robot (the depth
-        # camera only sees the terrain, so this changes nothing for the model)
         stage = omni.usd.get_context().get_stage()
         for other in range(env.unwrapped.num_envs):
             if other != env_id:
@@ -216,25 +193,23 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         start_time = time.time()
         with torch.inference_mode():
             if args_cli.closed_loop:
-                # the latest prediction, or a flat map while the inputs are not ready (start of an episode)
                 given = predicted.reshape(-1) if predicted is not None else torch.full_like(obs["policy"][env_id, map_slice], normalization["mean"])
                 policy_obs = obs["policy"].clone()
                 policy_obs[env_id, map_slice] = given.clip(-1.0, 1.0)
                 obs["policy"] = policy_obs
             actions = policy(obs)
             obs, _, dones, _ = env.step(actions)
-            frame = sensor_frames(dones)  # every step: the LiDAR stream follows its messages
+            frame, proprio = inputs(dones)
             if hasattr(policy, "reset"):
                 policy.reset(dones.bool())
-            # the reset step itself is dropped too: its sensor data may still show the previous episode
             clean_steps = 0 if dones[env_id] else clean_steps + 1
 
             if clean_steps > 0:
                 if clean_steps == 1:
-                    hidden_state = None  # the memory restarts with the episode
+                    hidden_state = None
                 prediction = terrain_model(
                     depth_data=frame[env_id][None, None],
-                    robot_info=obs["common"][env_id][None, None],
+                    robot_info=proprio[env_id][None, None],
                     hidden_state=hidden_state,
                 )
                 hidden_state = prediction.hidden_state
@@ -242,7 +217,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 errors.append(surface.update(env, env_id, predicted))
                 if viewport is not None and frames_written < args_cli.video_length:
                     frame = viewport.render_rgb_array()
-                    if frame is not None and frame.any():  # the first viewport frames can be black
+                    if frame is not None and frame.any():
                         frame = cv2.cvtColor(frame[..., :3], cv2.COLOR_RGB2BGR)
                         mae_now, mae_run = errors[-1].abs().mean() * 1000, torch.stack(errors).abs().mean() * 1000
                         _annotate(frame, [
@@ -257,7 +232,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                             video_writer = cv2.VideoWriter(str(video_path), fourcc, round(1.0 / step_dt), size)
                             if not video_writer.isOpened():
                                 raise RuntimeError(f"OpenCV cannot write {video_path}")
-                            video_writer.set(cv2.VIDEOWRITER_PROP_QUALITY, 80)  # MJPG: smaller files
+                            video_writer.set(cv2.VIDEOWRITER_PROP_QUALITY, 80)
                         video_writer.write(frame)
                         if args_cli.snapshot_interval > 0 and frames_written % args_cli.snapshot_interval == 0:
                             snapshots.append(cv2.resize(frame, (frame.shape[1] // 2, frame.shape[0] // 2)))
@@ -291,7 +266,6 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         video_writer.release()
         print(f"[INFO] {frames_written} frames written to: {video_path}")
     if snapshots:
-        # contact sheet, two snapshots per row
         if len(snapshots) % 2:
             snapshots.append(np.zeros_like(snapshots[0]))
         sheet = np.vstack([np.hstack(snapshots[i : i + 2]) for i in range(0, len(snapshots), 2)])

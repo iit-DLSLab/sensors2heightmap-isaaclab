@@ -1,11 +1,12 @@
+"""Drive one robot with the keyboard, the policy walking on the reconstructed heightmap."""
+
 import argparse
 import sys
 from pathlib import Path
 
 from isaaclab.app import AppLauncher
 
-# cli_args, sim_helpers and the terrain reconstructor are in train/, one folder up
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "train"))
 import cli_args  # isort: skip
 
 
@@ -19,16 +20,13 @@ parser.add_argument(
     "--draw",
     choices=("tiles", "spheres", "hidden"),
     default="tiles",
-    help="tiles: the predicted heightmap coloured by its error; spheres: the prediction alone, as blue spheres; "
-    "hidden: nothing drawn. C switches between them while driving.",
+    help="How to draw the prediction (C switches while driving).",
 )
 parser.add_argument(
     "--blind",
     choices=("zeros", "flat"),
     default=None,
-    help="The policy gets this map instead of the true or predicted one (the reconstructor still runs and is drawn): "
-    "zeros = every cell 0, which in the task's convention (base height - ground height - 0.5 m) is ground 0.5 m below "
-    "the base, about 20 cm below where it stands; flat = flat ground at the standing height (no terrain information).",
+    help="Give the policy an all-zero or a flat map instead (the reconstructor still runs and is drawn).",
 )
 parser.add_argument(
     "--show_ground_truth", action="store_true", help="Also draw small white dots at the true ground height."
@@ -36,13 +34,12 @@ parser.add_argument(
 parser.add_argument(
     "--show_depth_rays",
     action="store_true",
-    help="Keep the ray-hit debug visualization of the sensor (depth camera or LiDAR): shows which ground it sees.",
+    help="The ray-hit debug visualization of the sensor (depth camera or LiDAR): shows which ground it sees.",
 )
 parser.add_argument(
-    "--observation_noise",
+    "--no_observation_noise",
     action="store_true",
-    help="The task's observation noise, as on the robot: the policy and the reconstructor get the same noisy "
-    "proprioception; the heightmap is given without noise.",
+    help="Clean proprioception for policy and reconstructor (noisy by default, as on the robot).",
 )
 parser.add_argument(
     "--agent", type=str, default="rsl_rl_cfg_entry_point", help="RSL-RL agent configuration entry point."
@@ -50,13 +47,12 @@ parser.add_argument(
 cli_args.add_rsl_rl_args(parser)
 AppLauncher.add_app_launcher_args(parser)
 args_cli, hydra_args = parser.parse_known_args()
-args_cli.enable_cameras = True  # loads the viewport also without a display
+args_cli.enable_cameras = True
 sys.argv = [sys.argv[0]] + hydra_args
 
 app_launcher = AppLauncher(args_cli)
 simulation_app = app_launcher.app
 
-"""Rest everything follows."""
 
 import importlib.metadata as metadata
 import time
@@ -76,8 +72,7 @@ from isaaclab_tasks.utils.hydra import hydra_task_config
 import sim_helpers
 from terrain_reconstruction_mlp import build_terrain_reconstructor
 
-# command ranges the policy was trained on (custom_events._sample_random_commands): vx, vy (m/s), yaw rate (rad/s)
-COMMAND_LIMITS = (1.0, 0.25, 0.8)
+COMMAND_LIMITS = (0.8, 0.25, 0.5)
 
 
 @hydra_task_config(args_cli.task, args_cli.agent)
@@ -92,15 +87,14 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     env_cfg.scene.num_envs = 1
     env_cfg.seed = agent_cfg.seed
     env_cfg.sim.device = args_cli.device if args_cli.device is not None else env_cfg.sim.device
-    env_cfg.external_commands = True  # the keyboard sets the velocity command
-    env_cfg.episode_length_s = 3600.0  # no time-out reset while driving
-    if not args_cli.observation_noise:
+    env_cfg.episode_length_s = 3600.0
+    if args_cli.no_observation_noise:
         env_cfg.observation_noise_model = None
     env_cfg.perceptive_height_scanner.debug_vis = False
     if checkpoint is not None:
-        sim_helpers.configure_from_checkpoint(env_cfg, model_metadata)
-    env_cfg.depth_camera.debug_vis = env_cfg.unitree_l2_lidar.debug_vis = args_cli.show_depth_rays
-    # viewport behind the robot, following it
+        sim_helpers.configure_from_checkpoint(args_cli.task, model_metadata, "external", args_cli.show_depth_rays)
+    else:
+        sim_helpers.set_commands("external")
     env_cfg.sim.visualizer_cfgs = [
         KitVisualizerCfg(eye=(-1.6, -1.2, 1.0), lookat=(0.6, 0.0, 0.0), origin_type="asset", origin_track_path="robot")
     ]
@@ -122,7 +116,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         model.to(device).eval()
         mean, std = checkpoint["target_normalization"]["mean"], checkpoint["target_normalization"]["std"]
         surface = sim_helpers.HeightmapSurface(show_ground_truth=args_cli.show_ground_truth, mode=args_cli.draw)
-        sensor_frames = sim_helpers.SensorFrames(env, checkpoint["model_config"])
+        inputs = sim_helpers.ReconstructorInputs.from_metadata(
+            env, model_metadata, proprio_noise=not args_cli.no_observation_noise
+        )
 
     keyboard = Se2Keyboard(Se2KeyboardCfg(v_x_sensitivity=COMMAND_LIMITS[0], v_y_sensitivity=COMMAND_LIMITS[1],
                                           omega_z_sensitivity=COMMAND_LIMITS[2], sim_device=device))
@@ -142,7 +138,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     print(f"[INFO] Policy: {policy_checkpoint}")
     print(f"[INFO] Heightmap: {'predicted by ' + args_cli.terrain_model_path if model else 'true'}"
           + (f", the policy gets a {args_cli.blind} map instead" if args_cli.blind else ""))
-    print(f"[INFO] Observation noise: {'on (proprioception)' if args_cli.observation_noise else 'off'}")
+    print(f"[INFO] Observation noise: {'off' if args_cli.no_observation_noise else 'on (policy and reconstructor)'}"
+          + (f" | sensor errors: {model_metadata.get('sensor_errors')}" if model else ""))
 
     limits = torch.tensor(COMMAND_LIMITS, device=device)
     obs = env.get_observations()
@@ -150,19 +147,16 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     start_map, blind_map = sim_helpers.true_heightmap(env)[0], None
     if args_cli.blind == "zeros":
         blind_map = torch.zeros_like(start_map)
-    elif args_cli.blind == "flat":  # the robots start on flat platforms: the map of the first step is flat ground
+    elif args_cli.blind == "flat":
         blind_map = torch.full_like(start_map, start_map.mean().item())
-    hidden_state, fresh = None, True  # fresh: first step of an episode, skipped by the memory as in its training data
+    hidden_state, fresh = None, True
     step_dt = float(unwrapped.step_dt)
     while simulation_app.is_running():
         start_time = time.time()
         with torch.inference_mode():
             unwrapped._commands[:, :3] = torch.maximum(torch.minimum(keyboard.advance().to(device), limits), -limits)
-            # the task's noise is on the policy observation only: on the robot both get the same noisy sensors
-            proprio = obs["policy"][:, :map_slice.start] if args_cli.observation_noise else obs["common"]
             if model is not None:
-                # a fresh step is skipped, as in the training data: flat map, and the memory starts from the next step
-                frame = sensor_frames(torch.tensor([fresh], device=device))
+                frame, proprio = inputs(torch.tensor([fresh], device=device))
                 prediction = model(depth_data=frame[:, None], robot_info=proprio[:, None],
                                    hidden_state=hidden_state)
                 hidden_state = None if fresh else prediction.hidden_state
@@ -170,7 +164,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 given = flat if fresh else prediction.refined_heightmap.reshape(-1) * std + mean
                 surface.update(env, 0, given)
                 given = given.clip(-1.0, 1.0)
-            else:  # the true map, without the noise
+            else:
                 given = sim_helpers.true_heightmap(env)[0]
             if blind_map is not None:
                 given = blind_map
