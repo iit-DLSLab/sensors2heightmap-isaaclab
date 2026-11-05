@@ -115,7 +115,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     env_cfg.seed = agent_cfg.seed
     env_cfg.sim.device = args_cli.device if args_cli.device is not None else env_cfg.sim.device
     sim_helpers.configure_from_checkpoint(args_cli.task, model_metadata, debug_vis=args_cli.show_depth_rays)
-    env_cfg.perceptive_height_scanner.debug_vis = False
+    sim_helpers.hide_task_markers(env_cfg)
     if args_cli.closed_loop:
         env_cfg.observation_noise_model = None
 

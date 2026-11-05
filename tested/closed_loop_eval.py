@@ -86,7 +86,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     sim_helpers.configure_from_checkpoint(args_cli.task, model_metadata, "external" if args_cli.scenario else None)
     if args_cli.observation_noise == "off":
         env_cfg.observation_noise_model = None
-    env_cfg.perceptive_height_scanner.debug_vis = False
+    sim_helpers.hide_task_markers(env_cfg)
     if args_cli.scenario:
         env_cfg.episode_length_s = sum(duration for _, duration, _ in SCENARIO) + 10.0
     policy_checkpoint = sim_helpers.policy_checkpoint_path(args_cli, agent_cfg, model_metadata)

@@ -73,7 +73,15 @@ def attach_sensor(task: str, sensor_name: str, mount, robot_name: str, debug_vis
 
     def _setup_scene(env) -> None:
         env.scene._articulations = _SensorMount(env.scene, sensor_cfg)
-        setup_scene(env)
+        try:
+            setup_scene(env)
+        except ValueError as error:
+            if "matched no source-builder bodies" not in str(error):
+                raise
+            raise RuntimeError(
+                f"The robot of {task} has no {robot.BASE_PRIM_PATH} (robots/{robot_name}.py): is the installed "
+                "basic-locomotion-isaaclab the one the robot file is for (main)?"
+            ) from error
         env.scene._articulations = dict(env.scene._articulations)
         if SENSOR_NAME not in env.scene.sensors:
             raise RuntimeError(f"{task} has no 'robot' articulation in its scene: cannot mount {sensor_name} on it.")
@@ -183,6 +191,14 @@ def configure_from_checkpoint(task: str, metadata: dict, commands: str | None = 
     """Sensor and commands as in the reconstructor's training data."""
     attach_sensor(task, metadata["sensor_model"], metadata["sensor_mount"], metadata["robot"], debug_vis)
     set_commands(commands or ("forward" if metadata.get("commands") == "forward" else "default"))
+
+
+def hide_task_markers(env_cfg) -> None:
+    """Turns off the task's own debug drawings (noisy heightmap, edge zones, scanner rays)."""
+    env_cfg.perceptive_height_scanner.debug_vis = False
+    for name in ("visualize_height_map_with_noise", "visualize_feet_edge_swing_zone", "visualize_edge_map"):
+        if hasattr(env_cfg, name):
+            setattr(env_cfg, name, False)
 
 
 def true_heightmap(env: RslRlVecEnvWrapper) -> torch.Tensor:

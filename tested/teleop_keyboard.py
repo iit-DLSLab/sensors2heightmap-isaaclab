@@ -72,7 +72,7 @@ from isaaclab_tasks.utils.hydra import hydra_task_config
 import sim_helpers
 from terrain_reconstruction_mlp import build_terrain_reconstructor
 
-COMMAND_LIMITS = (0.8, 0.25, 0.5)
+COMMAND_LIMITS = (1.0, 0.25, 0.5)
 
 
 @hydra_task_config(args_cli.task, args_cli.agent)
@@ -90,7 +90,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     env_cfg.episode_length_s = 3600.0
     if args_cli.no_observation_noise:
         env_cfg.observation_noise_model = None
-    env_cfg.perceptive_height_scanner.debug_vis = False
+    sim_helpers.hide_task_markers(env_cfg)
     if checkpoint is not None:
         sim_helpers.configure_from_checkpoint(args_cli.task, model_metadata, "external", args_cli.show_depth_rays)
     else:

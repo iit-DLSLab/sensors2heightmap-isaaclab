@@ -59,6 +59,8 @@ python deploy/run_sensor2heightmap_ros2.py --model <models>/lidar.ts   # on the 
 The node reads the sensor, `/imu` and `/blind_state_legged` and publishes `/height_scan_markers` for basic-locomotion's
 `run_controller_ros2.py`. Use it with the policy whose data trained the reconstructor.
 
+A trained L2 reconstructor for the example policy: `example_policy/go2/concurrent_se_vision/reconstructor/`.
+
 ## License
 
 BSD 3-Clause, see [LICENSE](LICENSE).
