@@ -1,0 +1,11 @@
+# header
+dls2_interface/DlsHeader header
+
+# data
+float64[4] orientation  # x, y, z, w
+float64[3] orientation_rpy
+float64[9] orientation_covariance
+float64[3] angular_velocity
+float64[9] angular_velocity_covariance
+float64[3] linear_acceleration
+float64[9] linear_acceleration_covariance

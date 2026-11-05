@@ -4,3 +4,8 @@ __pycache__/
 
 # Collected terrain-reconstruction datasets (too large for GitHub)
 terrain_reconstruction_sequences/
+
+# colcon build of deploy/ros2_ws
+deploy/ros2_ws/build/
+deploy/ros2_ws/install/
+deploy/ros2_ws/log/

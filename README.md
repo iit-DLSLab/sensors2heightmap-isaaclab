@@ -51,6 +51,14 @@ python tested/closed_loop_eval.py --terrain_model_path <models>/lidar.pt --heigh
 
 ## Deploy
 
+The deploy needs no Isaac Lab: a [pixi](https://pixi.prefix.dev/latest/installation/) environment with ROS 2 (humble
+or lyrical) and CPU torch, and the robot's messages built in `deploy/ros2_ws`:
+
+```bash
+pixi run --manifest-path deploy/installation/pixi.toml -e humble build   # once, builds deploy/ros2_ws
+pixi shell --manifest-path deploy/installation/pixi.toml -e humble       # or -e lyrical
+```
+
 ```bash
 python deploy/terrain_reconstructor.py --checkpoint <models>/lidar.pt --output <models>/lidar.ts
 python deploy/run_sensor2heightmap_ros2.py --model <models>/lidar.ts   # on the robot's computer
