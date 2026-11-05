@@ -9,6 +9,7 @@ import argparse
 import json
 import math
 import sys
+import warnings
 from pathlib import Path
 
 import torch
@@ -40,7 +41,8 @@ class TerrainReconstructor:
         self.config = json.loads(extra_files["config.json"])
         self.device = device
         proprio = self.config["proprio"]
-        self.joint_order = torch.tensor([list(joint_names).index(name) for name in proprio["joint_names"]])
+        self.num_message_joints = len(joint_names)
+        self.joint_order = torch.tensor([list(joint_names).index(name) for name in proprio["joint_names"]], device=device)
         self.default_joint_pos = torch.tensor(proprio["default_joint_pos"], device=device)
         self.kind = self.config["sensor"]
         if self.kind == "lidar":
@@ -48,6 +50,18 @@ class TerrainReconstructor:
             position, quat_xyzw = self.config["lidar"]["mount"]
             self.rotation = lidar_grid.rotation_matrix(quat_xyzw, device)
             self.position = torch.tensor(position, device=device)
+        self.reset()
+        if torch.device(device).type == "cuda":
+            self._warm_up()
+
+    def _warm_up(self, steps: int = 3) -> None:
+        """The first CUDA calls take ~0.2 s (cuDNN, kernels): spent here, not at the first message."""
+        # the traced GRU has no flatten_parameters(): cuDNN compacts its weights at every call, cheap at this size
+        warnings.filterwarnings("ignore", message="RNN module weights are not part of single contiguous chunk")
+        joints = torch.zeros(self.num_message_joints)
+        for _ in range(steps):
+            self.step(torch.zeros(3), torch.tensor((0.0, 0.0, -1.0)), joints, joints, 0.0)
+        torch.cuda.synchronize(self.device)
         self.reset()
 
     def reset(self) -> None:

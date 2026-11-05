@@ -1,5 +1,5 @@
 """Runs the terrain reconstructor on the robot and publishes the heightmap on /height_scan_markers, the topic
-read by basic-locomotion's run_controller_ros2.py.
+read by basic-locomotion's run_controller_ros2.py. Settings in deploy/config.py.
 
     python deploy/run_sensor2heightmap_ros2.py --model <model>.ts [--robot go2]
 """
@@ -23,6 +23,7 @@ from sensor_msgs.msg import Image, PointCloud2
 from visualization_msgs.msg import Marker, MarkerArray
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import config as deploy_config  # noqa: E402  (deploy/config.py)
 import robots  # noqa: E402
 from sensors import lidar_grid  # noqa: E402
 from sensors.sensor_model import TOPICS  # noqa: E402
@@ -32,7 +33,11 @@ from terrain_reconstructor import TerrainReconstructor  # noqa: E402
 class Sensor2HeightmapROS2(Node):
     def __init__(self, model: str, robot: str, topic: str | None = None):
         super().__init__("Sensor2HeightmapROS2")
-        self.reconstructor = TerrainReconstructor(model, robots.load(robot).MESSAGE_JOINT_NAMES)
+        device = deploy_config.DEVICE
+        if torch.device(device).type == "cuda" and not torch.cuda.is_available():
+            self.get_logger().warning(f"deploy/config.py: DEVICE = {device!r}, but this torch has no CUDA: using the cpu")
+            device = "cpu"
+        self.reconstructor = TerrainReconstructor(model, robots.load(robot).MESSAGE_JOINT_NAMES, device)
         config = self.reconstructor.config
         self.imu = self.joints = None
         self.sensor_arrived = False
@@ -51,9 +56,21 @@ class Sensor2HeightmapROS2(Node):
         self.create_subscription(Imu, "/imu", self.imu_callback, 1)
         self.create_subscription(BlindState, "/blind_state_legged", self.joints_callback, 1)
         self.publisher_heightmap = self.create_publisher(MarkerArray, "/height_scan_markers", 1)
-        self.create_timer(config["step_dt"], self.step)
+        self.step_dt = config["step_dt"]
+        self.publish_frequency = deploy_config.PUBLISH_FREQUENCY
+        if not self.publish_frequency > 0.0:
+            raise ValueError(f"deploy/config.py: PUBLISH_FREQUENCY = {self.publish_frequency}, it must be > 0 Hz.")
+        if self.publish_frequency > 1.0 / self.step_dt:
+            self.get_logger().warning(
+                f"PUBLISH_FREQUENCY = {self.publish_frequency} Hz is above the reconstructor's {1.0 / self.step_dt:g} Hz: "
+                f"publishing every step"
+            )
+            self.publish_frequency = 1.0 / self.step_dt
+        self.publish_credit = 1.0  # the first prediction is published right away
+        self.create_timer(self.step_dt, self.step)
         self.get_logger().info(
-            f"{model}: {config['sensor_model']} on {topic} -> {rows}x{cols} heightmap on /height_scan_markers"
+            f"{model} on {device}: {config['sensor_model']} on {topic} -> {rows}x{cols} heightmap on /height_scan_markers, "
+            f"reconstructor at {1.0 / self.step_dt:g} Hz, published at {self.publish_frequency:g} Hz"
         )
 
     def lidar_callback(self, msg):
@@ -91,7 +108,14 @@ class Sensor2HeightmapROS2(Node):
             return
         angular_velocity, (x, y, z, w) = self.imu
         projected_gravity = -np.array((2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)))  # -R^T z
-        heights = self.reconstructor.step(angular_velocity, projected_gravity, *self.joints, time.monotonic()).numpy()
+        heights = self.reconstructor.step(angular_velocity, projected_gravity, *self.joints, time.monotonic()).cpu().numpy()
+        # PUBLISH_FREQUENCY on average, at most once per step, right after the step that is due
+        due = self.publish_credit >= 1.0 - 1e-6
+        self.publish_credit += self.publish_frequency * self.step_dt - due
+        if due:
+            self.publish(heights, projected_gravity)
+
+    def publish(self, heights, projected_gravity):
         # cells in base_link: the controller adds the base pose and takes their z
         frame = lidar_grid.yaw_frame(torch.tensor(projected_gravity[None], dtype=torch.float32))[0].numpy()
         points = np.column_stack((self.cells, -heights - lidar_grid.HEIGHT_OFFSET)) @ frame.T
