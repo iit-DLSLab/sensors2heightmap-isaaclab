@@ -42,6 +42,7 @@ class Sensor2HeightmapROS2(Node):
         self.imu = self.joints = None
         self.sensor_arrived = False
         self._last_warning_time = 0.0
+        self._last_step = None
         heightmap = config["heightmap"]
         rows, cols = heightmap["shape"]
         x = heightmap["offset"][0] - heightmap["size"][0] / 2 + heightmap["resolution"] * np.arange(cols)
@@ -56,21 +57,24 @@ class Sensor2HeightmapROS2(Node):
         self.create_subscription(Imu, "/imu", self.imu_callback, 1)
         self.create_subscription(BlindState, "/blind_state_legged", self.joints_callback, 1)
         self.publisher_heightmap = self.create_publisher(MarkerArray, "/height_scan_markers", 1)
-        self.step_dt = config["step_dt"]
+        self.step_dt = config["step_dt"]  # proprioception, always at the control step of training
+        on_message = self.reconstructor.step_on_message
+        self.predict_dt = self.reconstructor.message_period if on_message else self.step_dt
         self.publish_frequency = deploy_config.PUBLISH_FREQUENCY
         if not self.publish_frequency > 0.0:
             raise ValueError(f"deploy/config.py: PUBLISH_FREQUENCY = {self.publish_frequency}, it must be > 0 Hz.")
-        if self.publish_frequency > 1.0 / self.step_dt:
+        if self.publish_frequency > 1.0 / self.predict_dt:
             self.get_logger().warning(
-                f"PUBLISH_FREQUENCY = {self.publish_frequency} Hz is above the reconstructor's {1.0 / self.step_dt:g} Hz: "
+                f"PUBLISH_FREQUENCY = {self.publish_frequency} Hz is above the reconstructor's {1.0 / self.predict_dt:g} Hz: "
                 f"publishing every step"
             )
-            self.publish_frequency = 1.0 / self.step_dt
+            self.publish_frequency = 1.0 / self.predict_dt
         self.publish_credit = 1.0  # the first prediction is published right away
         self.create_timer(self.step_dt, self.step)
         self.get_logger().info(
             f"{model} on {device}: {config['sensor_model']} on {topic} -> {rows}x{cols} heightmap on /height_scan_markers, "
-            f"reconstructor at {1.0 / self.step_dt:g} Hz, published at {self.publish_frequency:g} Hz"
+            f"reconstructor at {1.0 / self.predict_dt:g} Hz{' (every sensor message)' if on_message else ''}, "
+            f"proprioception at {1.0 / self.step_dt:g} Hz, published at {self.publish_frequency:g} Hz"
         )
 
     def lidar_callback(self, msg):
@@ -80,13 +84,18 @@ class Sensor2HeightmapROS2(Node):
         # the L2 publishes at the end of its scan: time the message from its arrival, not from the robot's stamp
         self.reconstructor.sensor_message(points, time.monotonic() - self.reconstructor.message_period)
         self._sensor_arrived(f"the first LiDAR message ({len(points)} points)")
+        if self.reconstructor.step_on_message and self._last_step is not None:
+            self.predict(time.monotonic())
+
+    def _warn(self, text: str) -> None:
+        now = time.monotonic()
+        if now - self._last_warning_time >= 2.0:
+            self.get_logger().warning(text)
+            self._last_warning_time = now
 
     def depth_callback(self, msg):
         if msg.encoding != "16UC1":
-            now = time.monotonic()
-            if now - self._last_warning_time >= 2.0:
-                self.get_logger().warning(f"Ignoring a {msg.encoding} depth image: expected 16UC1 (mm)")
-                self._last_warning_time = now
+            self._warn(f"Ignoring a {msg.encoding} depth image: expected 16UC1 (mm)")
             return
         depth = np.frombuffer(msg.data, dtype=np.uint16).reshape(msg.height, msg.step // 2)[:, :msg.width]
         self.reconstructor.sensor_message(depth.astype(np.float32) * 0.001, time.monotonic())
@@ -103,17 +112,31 @@ class Sensor2HeightmapROS2(Node):
     def joints_callback(self, msg):
         self.joints = (np.array(msg.joints_position), np.array(msg.joints_velocity))
 
+    def _projected_gravity(self) -> np.ndarray:
+        x, y, z, w = self.imu[1]
+        return -np.array((2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)))  # -R^T z
+
     def step(self):
+        """Every control step: proprioception, and the network too unless it steps at the sensor messages."""
         if self.imu is None or self.joints is None or not self.sensor_arrived:
             return
-        angular_velocity, (x, y, z, w) = self.imu
-        projected_gravity = -np.array((2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)))  # -R^T z
-        heights = self.reconstructor.step(angular_velocity, projected_gravity, *self.joints, time.monotonic()).cpu().numpy()
-        # PUBLISH_FREQUENCY on average, at most once per step, right after the step that is due
+        now = time.monotonic()
+        if self._last_step is not None and now - self._last_step > 2 * self.step_dt:
+            self._warn(f"No proprioception step for {(now - self._last_step) * 1000:.0f} ms (one every "
+                       f"{self.step_dt * 1000:.0f} ms): the CPU is too busy (run the controller with one "
+                       "torch/onnxruntime thread too)")
+        self._last_step = now
+        self.reconstructor.proprio(self.imu[0], self._projected_gravity(), *self.joints)
+        if not self.reconstructor.step_on_message:
+            self.predict(now)
+
+    def predict(self, now: float) -> None:
+        heights = self.reconstructor.predict(now).cpu().numpy()
+        # PUBLISH_FREQUENCY on average, at most once per prediction, right after the one that is due
         due = self.publish_credit >= 1.0 - 1e-6
-        self.publish_credit += self.publish_frequency * self.step_dt - due
+        self.publish_credit += self.publish_frequency * self.predict_dt - due
         if due:
-            self.publish(heights, projected_gravity)
+            self.publish(heights, self._projected_gravity())
 
     def publish(self, heights, projected_gravity):
         # cells in base_link: the controller adds the base pose and takes their z
@@ -142,8 +165,11 @@ if __name__ == "__main__":
     parser.add_argument("--model", required=True, help="Reconstructor exported by deploy/terrain_reconstructor.py (.ts).")
     parser.add_argument("--robot", default="go2", help="Robot, a module of robots/: the order of its joints.")
     parser.add_argument("--topic", default=None, help="Sensor topic, if not the default of the sensor kind.")
+    parser.add_argument("--threads", type=int, default=1,
+                        help="Torch threads. The controller shares the CPU: more threads slow both loops down.")
     args = parser.parse_args()
 
+    torch.set_num_threads(args.threads)
     rclpy.init()
     node = Sensor2HeightmapROS2(args.model, args.robot, args.topic)
     rclpy.spin(node)

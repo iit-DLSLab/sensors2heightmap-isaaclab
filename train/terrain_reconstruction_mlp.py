@@ -273,14 +273,19 @@ class ProprioNoise:
         )
         self.history = history
 
-    def __call__(self, proprio: Tensor, generator: torch.Generator | None = None) -> Tensor:
-        """Noise on consecutive steps, (B, L, F)."""
+    def __call__(self, proprio: Tensor, generator: torch.Generator | None = None, offsets: Tensor | None = None) -> Tensor:
+        """Noise on the steps of segments, (B, L, F). offsets: control step of each (B, L), consecutive if None.
+        One reading per control step, with its noise in every history that holds it."""
         batch, steps = proprio.shape[:2]
+        device = proprio.device
         frames = proprio.view(batch, steps, self.history, -1)
-        noise_std, bias_std = self.noise_std.to(proprio.device), self.bias_std.to(proprio.device)
-        readings = torch.randn(batch, steps + self.history - 1, frames.shape[-1], device=proprio.device, generator=generator)
-        noise = (readings * noise_std).unfold(1, self.history, 1).transpose(-1, -2)
-        bias = torch.randn(batch, 1, 1, frames.shape[-1], device=proprio.device, generator=generator) * bias_std
+        if offsets is None:
+            offsets = torch.arange(steps, device=device).expand(batch, steps)
+        noise_std, bias_std = self.noise_std.to(device), self.bias_std.to(device)
+        readings = torch.randn(batch, int(offsets.max()) + self.history, frames.shape[-1], device=device, generator=generator)
+        window = offsets[..., None] + torch.arange(self.history, device=device)
+        noise = readings[torch.arange(batch, device=device)[:, None, None], window] * noise_std
+        bias = torch.randn(batch, 1, 1, frames.shape[-1], device=device, generator=generator) * bias_std
         return (frames + (noise + bias) * (frames != 0).any(dim=-1, keepdim=True)).view_as(proprio)
 
     def step(self, proprio: Tensor, restart: Tensor, state: dict | None, generator: torch.Generator | None = None):
@@ -333,13 +338,24 @@ def compute_reconstruction_losses(
 FRAME_KEYS = {"depth": "depth_data", "lidar": "lidar_grid"}
 
 
-class SequenceTerrainReconstructionDataset(Dataset):
-    """Segments of consecutive steps of one env, cut from the recordings, without resets inside."""
+def message_steps(chunks: list[dict]) -> Tensor:
+    """(steps, envs), True where a new LiDAR message arrived: the age channel of the grid drops."""
+    age_channel = chunks[0]["metadata"]["lidar_grid"]["channels"].index("age")
+    age = torch.cat([chunk["lidar_grid"][:, :, age_channel, 0, 0].float() for chunk in chunks])
+    return torch.cat((torch.zeros(1, age.shape[1], dtype=torch.bool), age[1:] < age[:-1] - 1e-3))
 
-    def __init__(self, dataset_path: str | Sequence[str], segment_length: int = 1):
+
+class SequenceTerrainReconstructionDataset(Dataset):
+    """Segments of consecutive steps of one env, cut from the recordings, without resets inside.
+
+    With on_message the steps are the control steps at which a LiDAR message arrived (the reconstructor steps at the
+    LiDAR rate), each with its proprioception history at the control step."""
+
+    def __init__(self, dataset_path: str | Sequence[str], segment_length: int = 1, on_message: bool = False):
         super().__init__()
         directories = [dataset_path] if isinstance(dataset_path, (str, Path)) else list(dataset_path)
         self.segment_length = segment_length
+        self.on_message = on_message
 
         self.runs: list[dict] = []
         index, targets = [], []
@@ -366,14 +382,29 @@ class SequenceTerrainReconstructionDataset(Dataset):
 
             dones = torch.cat([chunk["dones"] for chunk in chunks])
             resets = torch.cat([torch.zeros(1, dones.shape[1], dtype=torch.long), dones.long().cumsum(dim=0)])
-            first = torch.arange(dones.shape[0] - segment_length + 1)
-            clean = resets[first + segment_length] == resets[first]
-            sample_steps, sample_envs = clean.nonzero(as_tuple=True)
-            sample_steps = first[sample_steps]
-            index.append(torch.stack((torch.full_like(sample_steps, run), sample_steps, sample_envs), dim=1))
             all_targets = torch.cat([chunk["heightmaps"] for chunk in chunks])
-            targets.append(all_targets[sample_steps + segment_length - 1, sample_envs].float())
-            self.runs.append({"chunks": chunks, "starts": starts, "resets": resets})
+            record = {"chunks": chunks, "starts": starts, "resets": resets}
+            if on_message:
+                if frame_key != "lidar_grid":
+                    raise ValueError(f"{directory}: stepping at every message needs LiDAR data.")
+                record["messages"] = message_steps(chunks)
+                record["message_steps"] = [steps.nonzero().flatten() for steps in record["messages"].T]
+                for env, steps in enumerate(record["message_steps"]):
+                    count = len(steps) - segment_length + 1
+                    if count <= 0:
+                        continue
+                    first, last = steps[:count], steps[segment_length - 1:]
+                    positions = (resets[last + 1, env] == resets[first, env]).nonzero().flatten()
+                    index.append(torch.stack((torch.full_like(positions, run), positions, torch.full_like(positions, env)), dim=1))
+                    targets.append(all_targets[last[positions], env].float())
+            else:
+                first = torch.arange(dones.shape[0] - segment_length + 1)
+                clean = resets[first + segment_length] == resets[first]
+                sample_steps, sample_envs = clean.nonzero(as_tuple=True)
+                sample_steps = first[sample_steps]
+                index.append(torch.stack((torch.full_like(sample_steps, run), sample_steps, sample_envs), dim=1))
+                targets.append(all_targets[sample_steps + segment_length - 1, sample_envs].float())
+            self.runs.append(record)
 
         self.index = torch.cat(index)
         self.heightmaps = torch.cat(targets)
@@ -384,6 +415,7 @@ class SequenceTerrainReconstructionDataset(Dataset):
                if not torch.is_tensor(value) and key not in ("chunk_index", "first_step", "num_steps")},
             "dataset_directories": [str(directory) for directory in directories],
             "segment_length": segment_length,
+            "step_on_message": on_message,
         }
         commands = {run["chunks"][0]["metadata"].get("commands", "default") for run in self.runs}
         self.metadata["commands"] = commands.pop() if len(commands) == 1 else "mixed"
@@ -406,10 +438,17 @@ class SequenceTerrainReconstructionDataset(Dataset):
     def __len__(self) -> int:
         return self.index.shape[0]
 
-    def __getitem__(self, index: int) -> tuple[Tensor, Tensor, Tensor]:
+    def __getitem__(self, index: int) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+        """Sensor inputs, proprioception, targets and the control step of each step from the first."""
         run, first, env = self.index[index].tolist()
-        stop = first + self.segment_length
-        return tuple(self._rows(run, name, first, stop, env).float() for name in (self.frame_key, "proprio", "heightmaps"))
+        names = (self.frame_key, "proprio", "heightmaps")
+        if not self.on_message:
+            stop = first + self.segment_length
+            return (*(self._rows(run, name, first, stop, env).float() for name in names), torch.arange(self.segment_length))
+        steps = self.runs[run]["message_steps"][env][first:first + self.segment_length]
+        offsets = steps - steps[0]
+        span = (int(steps[0]), int(steps[-1]) + 1)
+        return (*(self._rows(run, name, *span, env)[offsets].float() for name in names), offsets)
 
 
 def _segment_prediction(model: nn.Module, depth_data: Tensor, robot_info: Tensor, burn_in: int = 0) -> TerrainReconstructionOutput:
@@ -447,7 +486,7 @@ def _run_epoch(
         depth_data = batch[0].to(device)
         robot_info = batch[1].to(device)
         if proprio_noise is not None:
-            robot_info = proprio_noise(robot_info, generator)
+            robot_info = proprio_noise(robot_info, generator, batch[3].to(device))
         target_heightmap = (batch[2].to(device) - target_mean) / target_std
 
         if is_training:
@@ -621,6 +660,7 @@ def run_terrain_reconstruction(
     learning_rate: float = 3e-4,
     reinit_fusion: bool = False,
     proprio_noise: bool = False,
+    step_on_message: bool = False,
 ) -> None:
     dataset_paths = [Path(p).expanduser().resolve() for p in ([path] if isinstance(path, (str, Path)) else path)]
     for dataset_path in dataset_paths:
@@ -634,7 +674,7 @@ def run_terrain_reconstruction(
     torch.manual_seed(0)
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
-    dataset = SequenceTerrainReconstructionDataset([str(p) for p in dataset_paths], segment_length)
+    dataset = SequenceTerrainReconstructionDataset([str(p) for p in dataset_paths], segment_length, step_on_message)
     is_valid = dataset.env_ids % 5 == 4
     train_ids, valid_ids = (~is_valid).nonzero().flatten(), is_valid.nonzero().flatten()
     if max_val_samples and len(valid_ids) > max_val_samples:
@@ -650,7 +690,7 @@ def run_terrain_reconstruction(
     )
     valid_loader = DataLoader(valid_dataset, batch_size=batch_size, shuffle=False, **loader_kwargs)
 
-    sample_depth, sample_robot_info, sample_target = dataset[0]
+    sample_depth, sample_robot_info, sample_target, _ = dataset[0]
     model_config = {
         "proprio_dim": sample_robot_info.shape[-1],
         "depth_channels": sample_depth.shape[-3],
@@ -700,7 +740,7 @@ def run_terrain_reconstruction(
     resume_path = output_path.with_suffix(".resume.pt")
     run_setup = {"model_config": model_config, "train_settings": train_settings, "num_epochs": num_epochs,
                  "batch_size": batch_size, "samples_per_epoch": samples_per_epoch, "dataset_path": dataset_path_record,
-                 "proprio_noise": proprio_noise}
+                 "proprio_noise": proprio_noise, "step_on_message": step_on_message}
     resume_info = {"setup": run_setup}
     if resume_path.exists():
         previous = torch.load(resume_path, map_location="cpu", weights_only=False)["info"]
@@ -730,6 +770,7 @@ def run_terrain_reconstruction(
                 "init_checkpoint": init_checkpoint,
                 "reinit_fusion": reinit_fusion,
                 "proprio_noise": proprio_noise,
+                "step_on_message": step_on_message,
                 "dataset_path": dataset_path_record,
                 "target_mean": target_normalization["mean"],
                 "target_std": target_normalization["std"],
@@ -764,7 +805,7 @@ def run_terrain_reconstruction(
 
     test_metrics = {}
     if test_dataset_path:
-        test_dataset = SequenceTerrainReconstructionDataset(test_dataset_path)
+        test_dataset = SequenceTerrainReconstructionDataset(test_dataset_path, on_message=step_on_message)
         test_metrics = _evaluate_refiner_breakdown(
             model, lambda: _predict_rollouts(model, test_dataset, device, target_normalization, TEST_WARMUP_STEPS)
         )
@@ -801,6 +842,7 @@ def run_terrain_reconstruction(
             "init_checkpoint": init_checkpoint,
             "reinit_fusion": reinit_fusion,
             "proprio_noise": proprio_noise,
+            "step_on_message": step_on_message,
             "test_metrics": test_metrics,
         },
         output_path,
@@ -921,7 +963,7 @@ def _predict(
     outputs = {"rough": [], "refined": [], "target": []}
     model.eval()
     with torch.no_grad():
-        for depth_data, robot_info, target in data_loader:
+        for depth_data, robot_info, target, _ in data_loader:
             prediction = _segment_prediction(model, depth_data.to(device), robot_info.to(device), burn_in)
             target = target[:, burn_in:]
             heightmap_size = target.shape[-2:]
@@ -939,35 +981,46 @@ def _predict_rollouts(
     min_age: int = 0,
     proprio_noise: ProprioNoise | None = None,
 ) -> dict[str, Tensor]:
-    """Runs the model through the recordings step by step, as on the robot."""
+    """Runs the model through the recordings step by step, as on the robot: at every control step, or (dataset
+    on_message) at every LiDAR message with the last prediction held in between. Scored at every control step."""
     mean, std = target_normalization["mean"], target_normalization["std"]
     outputs = {key: [] for key in ("rough", "refined", "target", "run", "step", "env", "age")}
     model.eval()
     with torch.no_grad():
         for run, record in enumerate(dataset.runs):
             resets = record["resets"]
+            num_envs = resets.shape[1]
             robot_info = torch.cat([chunk["proprio"] for chunk in record["chunks"]]).to(device)
-            age = torch.full((resets.shape[1],), -1)
-            hidden_state, noise_state, generator = None, None, torch.Generator(device).manual_seed(run)
+            age = torch.full((num_envs,), -1)
+            hidden_state = torch.zeros(1, num_envs, model.memory.hidden_size, device=device)
+            rough = refined = None
+            noise_state, generator = None, torch.Generator(device).manual_seed(run)
             for step in range(resets.shape[0] - 1):
                 clean = resets[step + 1] == resets[step]
                 age = torch.where(clean, age + 1, -1)
-                if hidden_state is not None:
-                    restart = (age == 0).to(device).view(1, -1, 1)
-                    hidden_state = torch.where(restart, torch.zeros_like(hidden_state), hidden_state)
+                hidden_state[:, (age == 0).to(device)] = 0.0
                 proprio = robot_info[step].float()
                 if proprio_noise is not None:
                     proprio, noise_state = proprio_noise.step(proprio, (age <= 0).to(device), noise_state, generator)
-                prediction = model(
-                    depth_data=dataset.step_rows(run, dataset.frame_key, step).to(device)[:, None].float(),
-                    robot_info=proprio[:, None],
-                    hidden_state=hidden_state,
-                )
-                hidden_state = prediction.hidden_state
+                stepping = record["messages"][step] if dataset.on_message else torch.ones(num_envs, dtype=torch.bool)
+                ids = stepping.nonzero().flatten().to(device)
+                if len(ids):
+                    prediction = model(
+                        depth_data=dataset.step_rows(run, dataset.frame_key, step).to(device)[ids, None].float(),
+                        robot_info=proprio[ids, None],
+                        hidden_state=hidden_state[:, ids].contiguous(),
+                    )
+                    hidden_state[:, ids] = prediction.hidden_state
+                    if rough is None:
+                        rough = torch.zeros(num_envs, *prediction.rough_heightmap.shape[-2:], device=device)
+                        refined = torch.zeros_like(rough)
+                    rough[ids], refined[ids] = prediction.rough_heightmap[:, 0, 0], prediction.refined_heightmap[:, 0, 0]
 
                 envs = (age >= min_age).nonzero().flatten()
-                outputs["rough"].append(prediction.rough_heightmap[envs.to(device), 0, 0].cpu() * std + mean)
-                outputs["refined"].append(prediction.refined_heightmap[envs.to(device), 0, 0].cpu() * std + mean)
+                if rough is None:
+                    continue
+                outputs["rough"].append(rough[envs.to(device)].cpu() * std + mean)
+                outputs["refined"].append(refined[envs.to(device)].cpu() * std + mean)
                 outputs["target"].append(dataset.step_rows(run, "heightmaps", step)[envs, 0].float())
                 outputs["run"].append(torch.full_like(envs, run))
                 outputs["step"].append(torch.full_like(envs, step))
@@ -1065,6 +1118,12 @@ def _parse_args() -> argparse.Namespace:
         help="Noisy proprioception in training, as the robot's readings (the task's observation_noise_std).",
     )
     parser.add_argument(
+        "--step_on_message",
+        action="store_true",
+        help="The reconstructor steps at every LiDAR message (~15 Hz) instead of every control step (50 Hz); the "
+        "proprioception history stays at the control step. --segment_length then counts messages (e.g. 32).",
+    )
+    parser.add_argument(
         "--reinit_fusion",
         action="store_true",
         help="With --init_checkpoint: the fusion MLP starts from random weights.",
@@ -1072,7 +1131,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--epochs", type=int, default=100, help="Number of training epochs.")
     parser.add_argument("--batch_size", type=int, default=32, help="Segments per batch.")
     parser.add_argument(
-        "--segment_length", type=int, default=96, help="Consecutive steps of one env per sample; the memory starts at zero."
+        "--segment_length", type=int, default=96,
+        help="Consecutive steps of the reconstructor (one env) per sample; the memory starts at zero."
     )
     parser.add_argument(
         "--burn_in", type=int, default=0, help="First steps of each segment: memory warm-up only, no loss and no gradient."
@@ -1121,4 +1181,5 @@ if __name__ == "__main__":
         learning_rate=args.learning_rate,
         reinit_fusion=args.reinit_fusion,
         proprio_noise=args.proprio_noise,
+        step_on_message=args.step_on_message,
     )

@@ -11,10 +11,10 @@ LEG_MESHES = [
 
 # position (m) and rotation (x, y, z, w) of the sensor frame in the base frame
 SENSORS = {
-    # calibrated on the rosbag of 2026-10-30 (setup_robot.py); the URDF rotation is wrong for the real L2
+    # as in basic-locomotion's go2_env_cfg.py: upside down, 15 deg forward (rotation of the URDF's radar_joint)
     "unitree_l2_lidar": {
-        "position": (0.28945, 0.0, 0.0507),
-        "rotation": (-0.86610, 0.48649, -0.10267, 0.05160),
+        "position": (0.31, 0.0, 0.02),
+        "rotation": (0.0, 0.99134, 0.0, 0.13132),
         "meshes": LEG_MESHES,  # the L2 sits inside the base meshes
     },
     # 20 deg down, ROS optical frame

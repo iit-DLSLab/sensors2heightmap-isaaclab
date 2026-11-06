@@ -260,12 +260,6 @@ class UnitreeL2LidarModel(SensorModel):
     """L2 messages as the robot gets them (latency, mount and gravity errors), put on the grid."""
 
     KIND = "lidar"
-    ERRORS = {
-        "sensor": {},
-        "bag": {"range_error": 0.04, "range_wavelength": (0.3, 1.2), "direction_error": 0.01,
-                "point_noise": (0.008, 0.02)},
-    }
-    DIRECTION_WAVES = 4
 
     @classmethod
     def sim_cfg(cls, prim_path: str, position, rotation, meshes: Sequence[str]) -> MultiMeshRayCasterCfg:
@@ -285,28 +279,21 @@ class UnitreeL2LidarModel(SensorModel):
         )
 
     def __init__(self, env, sensor, mount, heightmap: dict, latency=(0.0, 0.04), mount_position_error: float = 0.01,
-                 mount_angle_error: float = math.radians(1.0), gravity_angle_error: float = math.radians(1.0),
-                 range_error: float = 0.0, range_wavelength=(0.3, 1.2), direction_error: float = 0.0,
-                 point_noise=(0.0, 0.0)):
+                 mount_angle_error: float = math.radians(1.0), gravity_angle_error: float = math.radians(1.0)):
         super().__init__(env, sensor, mount, heightmap)
         self.robot = self.env.scene.articulations["robot"]
         self.grid = lidar_grid.grid_spec(heightmap)
         self.latency, self.position_error = latency, mount_position_error
         self.mount_angle_error, self.gravity_angle_error = mount_angle_error, gravity_angle_error
-        self.range_error, self.range_wavelength, self.point_noise = range_error, range_wavelength, point_noise
-        self.direction_amplitude = direction_error / math.sqrt(self.DIRECTION_WAVES / 2)
         num, rays, device = self.env.num_envs, self.sensor.num_rays, self.env.device
         self.mount_position = torch.tensor(mount[0], device=device)
         self.mount_rotation = lidar_grid.rotation_matrix(mount[1], device)
-        self.range_amplitude, self.range_wavenumber, self.range_phase, self.point_noise_std = torch.zeros(4, num, device=device)
-        self.direction_axes = torch.zeros(num, self.DIRECTION_WAVES, 3, device=device)
-        self.direction_frequency = torch.zeros(num, self.DIRECTION_WAVES, device=device)
-        self.direction_phase = torch.zeros(num, self.DIRECTION_WAVES, device=device)
         self.points = torch.full((num, rays, 3), math.inf, device=device)
         self.end = torch.zeros(num, device=device)
         self.pending = torch.full((num, rays, 3), math.inf, device=device)
         self.pending_end = torch.zeros(num, device=device)
         self.arrival = torch.full((num,), math.inf, device=device)
+        self.new_message = torch.zeros(num, dtype=torch.bool, device=device)  # a message arrived at this step
         self.rotation = self.mount_rotation.repeat(num, 1, 1)
         self.position = self.mount_position.repeat(num, 1)
         self.gravity_rotation = torch.eye(3, device=device).repeat(num, 1, 1)
@@ -333,27 +320,6 @@ class UnitreeL2LidarModel(SensorModel):
         self.rotation[env_ids] = _small_rotations(num, self.mount_angle_error, device) @ self.mount_rotation
         self.position[env_ids] = self.mount_position + (2.0 * torch.rand(num, 3, device=device) - 1.0) * self.position_error
         self.gravity_rotation[env_ids] = _small_rotations(num, self.gravity_angle_error, device)
-        uniform = lambda low, high, *shape: low + (high - low) * torch.rand(num, *shape, device=device)  # noqa: E731
-        self.range_amplitude[env_ids] = uniform(0.0, self.range_error)
-        self.range_wavenumber[env_ids] = 2.0 * math.pi / uniform(*self.range_wavelength)
-        self.range_phase[env_ids] = uniform(0.0, 2.0 * math.pi)
-        self.point_noise_std[env_ids] = uniform(*self.point_noise)
-        axes = torch.randn(num, self.DIRECTION_WAVES, 3, device=device)
-        self.direction_axes[env_ids] = axes / axes.norm(dim=-1, keepdim=True)
-        self.direction_frequency[env_ids] = uniform(3.0, 20.0, self.DIRECTION_WAVES)
-        self.direction_phase[env_ids] = uniform(0.0, 2.0 * math.pi, self.DIRECTION_WAVES)
-
-    def _range_errors(self, points: torch.Tensor, envs: torch.Tensor) -> torch.Tensor:
-        """Extra range errors of the rosbag (ERRORS['bag'])."""
-        ranges = points.norm(dim=-1, keepdim=True)
-        directions = points / ranges
-        error = self.range_amplitude[envs, None, None] * torch.sin(
-            self.range_wavenumber[envs, None, None] * ranges + self.range_phase[envs, None, None])
-        waves = torch.sin(self.direction_frequency[envs, None] * (directions @ self.direction_axes[envs].transpose(1, 2))
-                          + self.direction_phase[envs, None])
-        error = error + self.direction_amplitude * waves.sum(dim=-1, keepdim=True)
-        error = error + self.point_noise_std[envs, None, None] * torch.randn_like(ranges)
-        return points * (1.0 + error / ranges)
 
     def __call__(self, dones: torch.Tensor) -> torch.Tensor:
         dones = dones.bool()
@@ -364,10 +330,11 @@ class UnitreeL2LidarModel(SensorModel):
         self.last_update = last_update.clone()
         if new.any():
             latency = self.latency[0] + (self.latency[1] - self.latency[0]) * torch.rand(int(new.sum()), device=now.device)
-            self.pending[new] = self._range_errors(self.sensor.points_l2[new], new)
+            self.pending[new] = self.sensor.points_l2[new]
             self.pending_end[new] = last_update[new]
             self.arrival[new] = last_update[new] + latency
         arrived = self.arrival <= now + 1e-6
+        self.new_message = arrived
         if arrived.any():
             self.points[arrived] = self.pending[arrived]
             self.end[arrived] = self.pending_end[arrived]

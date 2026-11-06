@@ -72,7 +72,7 @@ from isaaclab_tasks.utils.hydra import hydra_task_config
 import sim_helpers
 from terrain_reconstruction_mlp import build_terrain_reconstructor
 
-COMMAND_LIMITS = (1.0, 0.25, 0.5)
+COMMAND_LIMITS = (1.2, 0.4, 0.5)
 
 
 @hydra_task_config(args_cli.task, args_cli.agent)
@@ -87,7 +87,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     env_cfg.scene.num_envs = 1
     env_cfg.seed = agent_cfg.seed
     env_cfg.sim.device = args_cli.device if args_cli.device is not None else env_cfg.sim.device
-    env_cfg.episode_length_s = 3600.0
+    env_cfg.episode_length_s = 50_000
     if args_cli.no_observation_noise:
         env_cfg.observation_noise_model = None
     sim_helpers.hide_task_markers(env_cfg)
@@ -157,13 +157,15 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             unwrapped._commands[:, :3] = torch.maximum(torch.minimum(keyboard.advance().to(device), limits), -limits)
             if model is not None:
                 frame, proprio = inputs(torch.tensor([fresh], device=device))
-                prediction = model(depth_data=frame[:, None], robot_info=proprio[:, None],
-                                   hidden_state=hidden_state)
-                hidden_state = None if fresh else prediction.hidden_state
-                flat = torch.full_like(obs["policy"][0, map_slice], mean)
-                given = flat if fresh else prediction.refined_heightmap.reshape(-1) * std + mean
-                surface.update(env, 0, given)
-                given = given.clip(-1.0, 1.0)
+                if fresh:
+                    hidden_state, predicted = None, torch.full_like(obs["policy"][0, map_slice], mean)
+                elif not checkpoint.get("step_on_message", False) or inputs.sensor_input.new_message[0]:
+                    prediction = model(depth_data=frame[:, None], robot_info=proprio[:, None],
+                                       hidden_state=hidden_state)
+                    hidden_state = prediction.hidden_state
+                    predicted = prediction.refined_heightmap.reshape(-1) * std + mean
+                surface.update(env, 0, predicted)
+                given = predicted.clip(-1.0, 1.0)
             else:
                 given = sim_helpers.true_heightmap(env)[0]
             if blind_map is not None:

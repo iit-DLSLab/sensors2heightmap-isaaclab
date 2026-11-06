@@ -43,7 +43,7 @@ parser.add_argument("--robot", default="go2", help="Robot, a module of robots/: 
 parser.add_argument(
     "--sensor_errors",
     default="sensor",
-    help="A key of the sensor's ERRORS, e.g. bag for the L2 errors measured on the Go2 rosbag.",
+    help="A key of the sensor's ERRORS, e.g. none for the depth camera without noise.",
 )
 parser.add_argument(
     "--forward_commands",

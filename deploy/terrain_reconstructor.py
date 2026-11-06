@@ -45,6 +45,7 @@ class TerrainReconstructor:
         self.joint_order = torch.tensor([list(joint_names).index(name) for name in proprio["joint_names"]], device=device)
         self.default_joint_pos = torch.tensor(proprio["default_joint_pos"], device=device)
         self.kind = self.config["sensor"]
+        self.step_on_message = self.config.get("step_on_message", False)  # else at every control step
         if self.kind == "lidar":
             self.message_period = self.config["lidar"]["message_period"]
             position, quat_xyzw = self.config["lidar"]["mount"]
@@ -67,6 +68,7 @@ class TerrainReconstructor:
     def reset(self) -> None:
         frames = self.config["proprio"]["history"]
         self.history = torch.zeros(frames, self.config["proprio_dim"] // frames, device=self.device)
+        self.gravity = torch.tensor((0.0, 0.0, -1.0), device=self.device)
         self.hidden = torch.zeros(1, 1, self.config["hidden_dim"], device=self.device)
         self.points = torch.full((1, 1, 3), math.inf, device=self.device)
         self.message_end = None
@@ -83,20 +85,31 @@ class TerrainReconstructor:
             depth = self.config["depth"]
             self.depth = decimate_depth(data, *depth["image_size"]).clip(0.0, depth["max_range"])[None, None]
 
-    @torch.no_grad()
-    def step(self, angular_velocity, projected_gravity, joint_position, joint_velocity, now: float) -> torch.Tensor:
+    def proprio(self, angular_velocity, projected_gravity, joint_position, joint_velocity) -> None:
+        """One control step of proprioception into the history (always at the control step of training)."""
+
         def tensor(value) -> torch.Tensor:
             return torch.as_tensor(value, dtype=torch.float32, device=self.device).flatten()
 
-        gravity = tensor(projected_gravity)
-        frame = torch.cat((tensor(angular_velocity), gravity, tensor(joint_position)[self.joint_order] - self.default_joint_pos,
+        self.gravity = tensor(projected_gravity)
+        frame = torch.cat((tensor(angular_velocity), self.gravity,
+                           tensor(joint_position)[self.joint_order] - self.default_joint_pos,
                            tensor(joint_velocity)[self.joint_order]))
         self.history = torch.cat((self.history[1:], frame[None]))
+
+    def step(self, angular_velocity, projected_gravity, joint_position, joint_velocity, now: float) -> torch.Tensor:
+        """Proprioception and prediction together, for a reconstructor that steps at every control step."""
+        self.proprio(angular_velocity, projected_gravity, joint_position, joint_velocity)
+        return self.predict(now)
+
+    @torch.no_grad()
+    def predict(self, now: float) -> torch.Tensor:
+        """One step of the network: the last sensor message and the proprioception history."""
         if self.kind == "lidar":
             age = now - self.message_end if self.message_end is not None else 1.0
             sensor_input = lidar_grid.lidar_grid(
-                self.points, gravity[None], torch.tensor([age], device=self.device), self.rotation, self.position,
-                self.config["lidar"]["grid"],
+                self.points, self.gravity[None], torch.tensor([age], dtype=torch.float32, device=self.device),
+                self.rotation, self.position, self.config["lidar"]["grid"],
             )
         else:
             sensor_input = self.depth
@@ -157,6 +170,7 @@ def export(checkpoint_path: str, output_path: str) -> None:
         "heightmap": {**metadata["heightmap"], "shape": list(model_config["heightmap_size"])},
         "flat_height": normalization["mean"],
         "step_dt": metadata["step_dt"],
+        "step_on_message": bool(checkpoint.get("step_on_message", False)),
         "checkpoint": str(Path(checkpoint_path).resolve()),
     }
     if kind == "lidar":

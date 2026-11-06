@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib
+import inspect
 import math
 import os
 import sys
@@ -151,9 +152,11 @@ class ReconstructorInputs:
 
     @classmethod
     def from_metadata(cls, env: RslRlVecEnvWrapper, metadata: dict, proprio_noise: bool = False) -> ReconstructorInputs:
-        """Inputs as in the reconstructor's training data."""
+        """Inputs as in the reconstructor's training data, without the errors the sensor model no longer has."""
+        accepted = inspect.signature(sensors.load(metadata["sensor_model"]).__init__).parameters
+        errors = {key: value for key, value in metadata["sensor_errors"].items() if key in accepted}
         return cls(env, metadata["sensor_model"], metadata["sensor_mount"], metadata["robot"],
-                   metadata["sensor_errors"], metadata["proprio_history"], proprio_noise)
+                   errors, metadata["proprio_history"], proprio_noise)
 
     def __call__(self, dones: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         return self.sensor_input(dones), self.proprio(dones)
@@ -210,8 +213,8 @@ def true_heightmap(env: RslRlVecEnvWrapper) -> torch.Tensor:
 
 def heightmap_slice(obs, env: RslRlVecEnvWrapper) -> slice:
     """Position of the heightmap in the policy observation."""
-    common_dim, cells = obs["common"].shape[1], true_heightmap(env).shape[1]
-    where = slice(common_dim, common_dim + cells)
+    common_dim, cells = obs["common"].shape[1], true_heightmap(env).shape[1] #common shape:(?) - heightmap shape: (?)
+    where = slice(common_dim, common_dim + cells) 
     offset = obs["policy"][:, where] - true_heightmap(env)
     if not torch.allclose(obs["policy"][:, :common_dim], obs["common"]) or offset.std(dim=1).max() > 1e-4:
         raise RuntimeError("The policy observation is not ['common', heightmap]: cannot replace the heightmap.")
