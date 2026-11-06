@@ -2,7 +2,7 @@
 # All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Closed loop: the policy walks on the true, predicted or flat heightmap and its falls and tracking are
+"""Closed loop: the policy walks on the true, predicted, flat or all-zero heightmap and its falls and tracking are
 measured."""
 
 
@@ -18,7 +18,7 @@ import cli_args  # isort: skip
 
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("--terrain_model_path", type=str, required=True, help="Checkpoint of the terrain reconstructor.")
-parser.add_argument("--heightmap", choices=("true", "predicted", "flat"), required=True, help="Map the policy gets.")
+parser.add_argument("--heightmap", choices=("true", "predicted", "flat", "zeros"), required=True, help="Map the policy gets.")
 parser.add_argument("--task", type=str, default="Locomotion-Go2-Rough-Vision", help="Isaac Lab task to run.")
 parser.add_argument("--num_envs", type=int, default=256, help="Number of simulated environments.")
 parser.add_argument("--num_steps", type=int, default=3000, help="Control steps to run (50 per second), random commands.")
@@ -129,7 +129,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     totals = [dict.fromkeys(keys, 0.0) for _ in phases]
     flat_map = torch.full((num_envs, rows * cols), mean, device=device)
     fresh = torch.ones(num_envs, dtype=torch.bool, device=device)
-    hidden_state = None
+    hidden_state = torch.zeros(1, num_envs, model.memory.hidden_size, device=device)
+    predicted_map = flat_map.clone()
+    on_message = checkpoint.get("step_on_message", False)  # else the reconstructor steps at every control step
     trace = None
     if args_cli.trace:
         trace = {key: [] for key in ("ground_error", "abs_ground_error", "base_height", "forward_velocity", "ready", "dones")}
@@ -144,9 +146,13 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 true_map = sim_helpers.true_heightmap(env)
                 frame, proprio = inputs(fresh)
                 prediction = model(depth_data=frame[:, None], robot_info=proprio[:, None], hidden_state=hidden_state)
-                hidden_state = torch.where(fresh.view(1, -1, 1), torch.zeros_like(prediction.hidden_state), prediction.hidden_state)
+                # between messages the memory and the map stay as they are
+                stepping = (inputs.sensor_input.new_message if on_message else torch.ones_like(fresh)) & ~fresh
+                hidden_state = torch.where(stepping.view(1, -1, 1), prediction.hidden_state, hidden_state)
+                hidden_state = torch.where(fresh.view(1, -1, 1), torch.zeros_like(hidden_state), hidden_state)
                 ready = ~fresh
-                predicted_map = (prediction.refined_heightmap.reshape(num_envs, -1) * std + mean).clip(-1.0, 1.0)
+                new_map = (prediction.refined_heightmap.reshape(num_envs, -1) * std + mean).clip(-1.0, 1.0)
+                predicted_map = torch.where(stepping[:, None], new_map, predicted_map)
                 predicted_map = torch.where(ready[:, None], predicted_map, flat_map)
                 cell_error = (predicted_map - true_map).abs().view(num_envs, rows, cols)
                 total["map_error"] += cell_error.mean(dim=(1, 2)).sum().item()
@@ -163,6 +169,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                     given_map = predicted_map
                 elif args_cli.heightmap == "flat":
                     given_map = flat_map
+                elif args_cli.heightmap == "zeros":
+                    given_map = torch.zeros_like(true_map)
                 else:
                     given_map = true_map
                 policy_obs = obs["policy"]
