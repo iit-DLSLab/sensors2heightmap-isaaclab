@@ -30,16 +30,21 @@ Collect (train seeds 42-45, test seeds 7-8, with and without `--forward_commands
 ```bash
 python train/collect_sensors2heightmap.py --task=Locomotion-Go2-Rough-Vision --num_envs=496 \
   --checkpoint=example_policy/go2/concurrent_se_vision/exported/policy.pt \
-  --sensor unitree_l2_lidar --sensor_errors bag --forward_commands --seed=42 --num_steps=1200 \
+  --sensor unitree_l2_lidar --forward_commands --seed=42 --num_steps=1200 \
   --dataset_path=<data>/lidar_fwd_train_seed42
 ```
 
-Train (`--proprio_noise` adds the robot's IMU and joint noise):
+Train (`--proprio_noise` adds the robot's IMU and joint noise; `--step_on_message` steps the network at every LiDAR
+message, ~15 Hz, with the proprioception still at the 50 Hz control step, and `--segment_length` counts messages):
 
 ```bash
 python train/terrain_reconstruction_mlp.py --dataset_path <data>/lidar_*train_seed* \
-  --test_dataset_path <data>/lidar_*test_seed* --model_path <models>/lidar.pt --proprio_noise --wandb
+  --test_dataset_path <data>/lidar_*test_seed* --model_path <models>/lidar.pt --proprio_noise \
+  --step_on_message --segment_length 32 --wandb
 ```
+
+`--lidar_window 3` gives the network the last 3 LiDAR messages: `--lidar_window_mode aligned` moves the older ones into
+the current grid with the odometry from the proprioception (`sensors/odometry.py`), `stacked` passes them as they are.
 
 Test in simulation:
 
@@ -68,6 +73,11 @@ The node reads the sensor, `/imu` and `/blind_state_legged` and publishes `/heig
 `run_controller_ros2.py`. Use it with the policy whose data trained the reconstructor. `deploy/config.py` sets how often
 the heightmap is published (`PUBLISH_FREQUENCY`; the reconstructor always steps at the step of its training) and where
 the reconstructor runs (`DEVICE`, `"cuda"` or `"cpu"`; GPU needs a CUDA torch in the pixi environment).
+`EMPTY_ZONE_X` empties a band of the LiDAR grid before the network, e.g. `(-0.15, 0.15)` under the body. Models trained
+with a LiDAR window run with their window; the `.ts` carries it.
+
+The node runs torch on one thread (`--threads`). The controller shares the CPU, so give it one torch and one onnxruntime
+thread as well, or both loops slow down: the policy then runs far below 50 Hz and the robot falls.
 
 A trained L2 reconstructor for the example policy: `example_policy/go2/concurrent_se_vision/reconstructor/`.
 
