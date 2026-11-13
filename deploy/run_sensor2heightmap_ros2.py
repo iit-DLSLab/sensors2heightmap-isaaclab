@@ -37,7 +37,8 @@ class Sensor2HeightmapROS2(Node):
         if torch.device(device).type == "cuda" and not torch.cuda.is_available():
             self.get_logger().warning(f"deploy/config.py: DEVICE = {device!r}, but this torch has no CUDA: using the cpu")
             device = "cpu"
-        self.reconstructor = TerrainReconstructor(model, robots.load(robot).MESSAGE_JOINT_NAMES, device)
+        empty_zone = getattr(deploy_config, "EMPTY_ZONE_X", None)
+        self.reconstructor = TerrainReconstructor(model, robots.load(robot).MESSAGE_JOINT_NAMES, device, empty_zone)
         config = self.reconstructor.config
         self.imu = self.joints = None
         self.sensor_arrived = False
@@ -75,6 +76,9 @@ class Sensor2HeightmapROS2(Node):
             f"{model} on {device}: {config['sensor_model']} on {topic} -> {rows}x{cols} heightmap on /height_scan_markers, "
             f"reconstructor at {1.0 / self.predict_dt:g} Hz{' (every sensor message)' if on_message else ''}, "
             f"proprioception at {1.0 / self.step_dt:g} Hz, published at {self.publish_frequency:g} Hz"
+            + (f", window of {self.reconstructor.window} messages ({self.reconstructor.window_mode})"
+               if self.reconstructor.window > 1 else "")
+            + (f", grid cells at x {empty_zone[0]:+.2f}..{empty_zone[1]:+.2f} m emptied" if empty_zone else "")
         )
 
     def lidar_callback(self, msg):

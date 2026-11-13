@@ -6,6 +6,7 @@ import argparse
 import bisect
 import glob
 import os
+import sys
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -16,6 +17,11 @@ from torch import Tensor, nn
 from torch.utils.checkpoint import checkpoint
 from torch.utils.data import DataLoader, Dataset, RandomSampler, Subset
 from tqdm import tqdm
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import robots  # noqa: E402
+from sensors import lidar_grid  # noqa: E402
+from sensors.odometry import Odometry, odometry  # noqa: E402
 
 
 def _make_group_norm(num_channels: int) -> nn.GroupNorm:
@@ -349,13 +355,20 @@ class SequenceTerrainReconstructionDataset(Dataset):
     """Segments of consecutive steps of one env, cut from the recordings, without resets inside.
 
     With on_message the steps are the control steps at which a LiDAR message arrived (the reconstructor steps at the
-    LiDAR rate), each with its proprioception history at the control step."""
+    LiDAR rate), each with its proprioception history at the control step. With a window of K messages the sensor input
+    of a step comes from the last K messages (sensors/lidar_grid.window_input): stacked as they are, or aligned with
+    the odometry from the proprioception (sensors/odometry.py)."""
 
-    def __init__(self, dataset_path: str | Sequence[str], segment_length: int = 1, on_message: bool = False):
+    def __init__(self, dataset_path: str | Sequence[str], segment_length: int = 1, on_message: bool = False,
+                 window: int = 1, window_mode: str = "aligned"):
         super().__init__()
         directories = [dataset_path] if isinstance(dataset_path, (str, Path)) else list(dataset_path)
         self.segment_length = segment_length
         self.on_message = on_message
+        self.window, self.window_mode = window, window_mode
+        self.proprio_noise = None  # aligned windows: the noise goes on the readings here, the odometry needs it
+        if window > 1 and not on_message:
+            raise ValueError("A window of LiDAR messages needs on_message.")
 
         self.runs: list[dict] = []
         index, targets = [], []
@@ -389,11 +402,12 @@ class SequenceTerrainReconstructionDataset(Dataset):
                     raise ValueError(f"{directory}: stepping at every message needs LiDAR data.")
                 record["messages"] = message_steps(chunks)
                 record["message_steps"] = [steps.nonzero().flatten() for steps in record["messages"].T]
+                needed = segment_length + window - 1  # the window's older messages come before the segment
                 for env, steps in enumerate(record["message_steps"]):
-                    count = len(steps) - segment_length + 1
+                    count = len(steps) - needed + 1
                     if count <= 0:
                         continue
-                    first, last = steps[:count], steps[segment_length - 1:]
+                    first, last = steps[:count], steps[needed - 1:]
                     positions = (resets[last + 1, env] == resets[first, env]).nonzero().flatten()
                     index.append(torch.stack((torch.full_like(positions, run), positions, torch.full_like(positions, env)), dim=1))
                     targets.append(all_targets[last[positions], env].float())
@@ -416,7 +430,17 @@ class SequenceTerrainReconstructionDataset(Dataset):
             "dataset_directories": [str(directory) for directory in directories],
             "segment_length": segment_length,
             "step_on_message": on_message,
+            "lidar_window": {"messages": window, "mode": window_mode},
         }
+        if window > 1:
+            self.grid, self.step_dt = metadata["lidar_grid"], metadata["step_dt"]
+            self.history = metadata["proprio_history"]
+            joint_names = metadata["proprio_joint_names"]
+            legs = [f"{leg}_{joint}_joint" for leg in ("FL", "FR", "RL", "RR") for joint in ("hip", "thigh", "calf")]
+            if list(joint_names) != legs:
+                raise ValueError(f"The odometry needs the joints leg by leg (FL, FR, RL, RR): {joint_names}")
+            self.default_joint_pos = torch.tensor(metadata["proprio_default_joint_pos"])
+            self.kinematics = robots.load(metadata["robot"]).LEG_KINEMATICS
         commands = {run["chunks"][0]["metadata"].get("commands", "default") for run in self.runs}
         self.metadata["commands"] = commands.pop() if len(commands) == 1 else "mixed"
 
@@ -445,10 +469,43 @@ class SequenceTerrainReconstructionDataset(Dataset):
         if not self.on_message:
             stop = first + self.segment_length
             return (*(self._rows(run, name, first, stop, env).float() for name in names), torch.arange(self.segment_length))
-        steps = self.runs[run]["message_steps"][env][first:first + self.segment_length]
-        offsets = steps - steps[0]
+        if self.window == 1:
+            steps = self.runs[run]["message_steps"][env][first:first + self.segment_length]
+            offsets = steps - steps[0]
+            span = (int(steps[0]), int(steps[-1]) + 1)
+            return (*(self._rows(run, name, *span, env)[offsets].float() for name in names), offsets)
+
+        steps = self.runs[run]["message_steps"][env][first:first + self.segment_length + self.window - 1]
+        segment = steps[self.window - 1:]
         span = (int(steps[0]), int(steps[-1]) + 1)
-        return (*(self._rows(run, name, *span, env)[offsets].float() for name in names), offsets)
+        at = steps - steps[0]
+        grids = self._rows(run, self.frame_key, *span, env)[at].float()
+        proprio = self._rows(run, "proprio", *span, env).float()
+        heightmaps = self._rows(run, "heightmaps", *span, env)[at[self.window - 1:]].float()
+        windows = torch.arange(self.segment_length)[:, None] + torch.arange(self.window)
+        dt = (segment[:, None] - steps[windows]).float() * self.step_dt
+        valid = torch.ones(windows.shape, dtype=torch.bool)
+        histories, poses = proprio[at[self.window - 1:]], None
+        if self.window_mode == "aligned":
+            readings = proprio.view(len(proprio), self.history, -1)[:, -1]  # one reading per control step
+            if self.proprio_noise is not None:
+                # validation envs always get the same noise
+                generator = torch.Generator().manual_seed(index) if env % 5 == 4 else None
+                readings, histories = self._noisy(readings, proprio, at[self.window - 1:], generator)
+            poses = odometry(readings, self.default_joint_pos, self.kinematics, self.step_dt)[at][windows]
+        frames = lidar_grid.window_input(grids[windows], dt, valid, self.window_mode, self.grid, poses)
+        return frames, histories, heightmaps, segment - segment[0]
+
+    def _noisy(self, readings: Tensor, proprio: Tensor, at: Tensor, generator: torch.Generator | None):
+        """The readings with the robot's noise, and the histories at the steps at, with the same noise."""
+        noise = self.proprio_noise
+        history = noise.history
+        draws = torch.randn(len(readings) + history - 1, readings.shape[-1], generator=generator) * noise.noise_std
+        bias = torch.randn(readings.shape[-1], generator=generator) * noise.bias_std
+        frames = proprio[at].view(len(at), history, -1)
+        held = draws[at[:, None] + torch.arange(history)]  # reading at step s - history + 1 + j for frame j
+        histories = frames + (held + bias) * (frames != 0).any(dim=-1, keepdim=True)
+        return readings + draws[history - 1:] + bias, histories.view(len(at), -1)
 
 
 def _segment_prediction(model: nn.Module, depth_data: Tensor, robot_info: Tensor, burn_in: int = 0) -> TerrainReconstructionOutput:
@@ -661,6 +718,8 @@ def run_terrain_reconstruction(
     reinit_fusion: bool = False,
     proprio_noise: bool = False,
     step_on_message: bool = False,
+    lidar_window: int = 1,
+    lidar_window_mode: str = "aligned",
 ) -> None:
     dataset_paths = [Path(p).expanduser().resolve() for p in ([path] if isinstance(path, (str, Path)) else path)]
     for dataset_path in dataset_paths:
@@ -674,7 +733,9 @@ def run_terrain_reconstruction(
     torch.manual_seed(0)
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
-    dataset = SequenceTerrainReconstructionDataset([str(p) for p in dataset_paths], segment_length, step_on_message)
+    dataset = SequenceTerrainReconstructionDataset([str(p) for p in dataset_paths], segment_length, step_on_message,
+                                                   lidar_window, lidar_window_mode)
+    window_record = {"messages": lidar_window, "mode": lidar_window_mode}
     is_valid = dataset.env_ids % 5 == 4
     train_ids, valid_ids = (~is_valid).nonzero().flatten(), is_valid.nonzero().flatten()
     if max_val_samples and len(valid_ids) > max_val_samples:
@@ -704,6 +765,9 @@ def run_terrain_reconstruction(
     noise = task_proprio_noise(dataset.metadata)
     if proprio_noise and noise is None:
         raise FileNotFoundError("--proprio_noise needs the policy's params/env.yaml (checkpoint_path of the data).")
+    train_noise = noise if proprio_noise else None
+    if train_noise is not None and lidar_window > 1 and lidar_window_mode == "aligned":
+        dataset.proprio_noise, train_noise = noise, None  # the odometry works on the noisy readings
     train_heightmaps = dataset.heightmaps[train_dataset.indices]
     target_normalization = {
         "mean": train_heightmaps.mean().item(),
@@ -740,7 +804,7 @@ def run_terrain_reconstruction(
     resume_path = output_path.with_suffix(".resume.pt")
     run_setup = {"model_config": model_config, "train_settings": train_settings, "num_epochs": num_epochs,
                  "batch_size": batch_size, "samples_per_epoch": samples_per_epoch, "dataset_path": dataset_path_record,
-                 "proprio_noise": proprio_noise, "step_on_message": step_on_message}
+                 "proprio_noise": proprio_noise, "step_on_message": step_on_message, "lidar_window": window_record}
     resume_info = {"setup": run_setup}
     if resume_path.exists():
         previous = torch.load(resume_path, map_location="cpu", weights_only=False)["info"]
@@ -771,6 +835,7 @@ def run_terrain_reconstruction(
                 "reinit_fusion": reinit_fusion,
                 "proprio_noise": proprio_noise,
                 "step_on_message": step_on_message,
+                "lidar_window": window_record,
                 "dataset_path": dataset_path_record,
                 "target_mean": target_normalization["mean"],
                 "target_std": target_normalization["std"],
@@ -798,14 +863,15 @@ def run_terrain_reconstruction(
         target_std=target_normalization["std"],
         resume_path=resume_path,
         resume_info=resume_info,
-        proprio_noise=noise if proprio_noise else None,
+        proprio_noise=train_noise,
         **train_settings,
     )
     best_metrics = min(history, key=lambda metrics: metrics["val_refined_loss"])
 
     test_metrics = {}
     if test_dataset_path:
-        test_dataset = SequenceTerrainReconstructionDataset(test_dataset_path, on_message=step_on_message)
+        test_dataset = SequenceTerrainReconstructionDataset(test_dataset_path, on_message=step_on_message,
+                                                            window=lidar_window, window_mode=lidar_window_mode)
         test_metrics = _evaluate_refiner_breakdown(
             model, lambda: _predict_rollouts(model, test_dataset, device, target_normalization, TEST_WARMUP_STEPS)
         )
@@ -843,6 +909,7 @@ def run_terrain_reconstruction(
             "reinit_fusion": reinit_fusion,
             "proprio_noise": proprio_noise,
             "step_on_message": step_on_message,
+            "lidar_window": window_record,
             "test_metrics": test_metrics,
         },
         output_path,
@@ -995,18 +1062,42 @@ def _predict_rollouts(
             hidden_state = torch.zeros(1, num_envs, model.memory.hidden_size, device=device)
             rough = refined = None
             noise_state, generator = None, torch.Generator(device).manual_seed(run)
+            window, aligned = dataset.window, dataset.window_mode == "aligned"
+            if window > 1:  # the last messages of every env, with their control step and base pose
+                grid_shape = dataset.step_rows(run, dataset.frame_key, 0).shape[1:]
+                grids = torch.zeros(num_envs, window, *grid_shape, device=device)
+                message_step = torch.zeros(num_envs, window, device=device)
+                poses = torch.zeros(num_envs, window, 4, device=device)
+                valid = torch.zeros(num_envs, window, dtype=torch.bool, device=device)
+                odometry_state = Odometry(
+                    num_envs, dataset.default_joint_pos, dataset.kinematics, dataset.step_dt, device
+                )
             for step in range(resets.shape[0] - 1):
                 clean = resets[step + 1] == resets[step]
                 age = torch.where(clean, age + 1, -1)
                 hidden_state[:, (age == 0).to(device)] = 0.0
                 proprio = robot_info[step].float()
+                restart = (age <= 0).to(device)
                 if proprio_noise is not None:
-                    proprio, noise_state = proprio_noise.step(proprio, (age <= 0).to(device), noise_state, generator)
+                    proprio, noise_state = proprio_noise.step(proprio, restart, noise_state, generator)
+                if window > 1:
+                    valid[restart] = False
+                    pose = odometry_state.step(proprio.view(num_envs, dataset.history, -1)[:, -1], restart)
                 stepping = record["messages"][step] if dataset.on_message else torch.ones(num_envs, dtype=torch.bool)
                 ids = stepping.nonzero().flatten().to(device)
                 if len(ids):
+                    sensor = dataset.step_rows(run, dataset.frame_key, step).to(device)[ids].float()
+                    if window > 1:
+                        shifted = lambda buffer, new: torch.cat((buffer[ids, 1:], new[:, None]), dim=1)  # noqa: E731
+                        grids[ids] = shifted(grids, sensor)
+                        message_step[ids] = shifted(message_step, torch.full((len(ids),), float(step), device=device))
+                        valid[ids] = shifted(valid, torch.ones(len(ids), dtype=torch.bool, device=device))
+                        poses[ids] = shifted(poses, pose[ids])
+                        dt = (step - message_step[ids]) * dataset.step_dt
+                        sensor = lidar_grid.window_input(grids[ids], dt, valid[ids], dataset.window_mode, dataset.grid,
+                                                         poses[ids] if aligned else None)
                     prediction = model(
-                        depth_data=dataset.step_rows(run, dataset.frame_key, step).to(device)[ids, None].float(),
+                        depth_data=sensor[:, None],
                         robot_info=proprio[ids, None],
                         hidden_state=hidden_state[:, ids].contiguous(),
                     )
@@ -1124,6 +1215,15 @@ def _parse_args() -> argparse.Namespace:
         "proprioception history stays at the control step. --segment_length then counts messages (e.g. 32).",
     )
     parser.add_argument(
+        "--lidar_window", type=int, default=1,
+        help="With --step_on_message: the sensor input comes from the last N LiDAR messages (1: the current one only).",
+    )
+    parser.add_argument(
+        "--lidar_window_mode", choices=("aligned", "stacked"), default="aligned",
+        help="aligned: the older messages moved into the current one with the odometry from the proprioception and "
+        "merged into one grid; stacked: the grids as they are, one after the other, the network aligns them.",
+    )
+    parser.add_argument(
         "--reinit_fusion",
         action="store_true",
         help="With --init_checkpoint: the fusion MLP starts from random weights.",
@@ -1182,4 +1282,6 @@ if __name__ == "__main__":
         reinit_fusion=args.reinit_fusion,
         proprio_noise=args.proprio_noise,
         step_on_message=args.step_on_message,
+        lidar_window=args.lidar_window,
+        lidar_window_mode=args.lidar_window_mode,
     )

@@ -1,4 +1,4 @@
-"""Unitree L2 LiDAR model. Scan pattern, timing and errors identified from a Go2 rosbag."""
+"""Unitree L2 LiDAR model. Scan pattern and timing identified from a Go2 rosbag"""
 
 from __future__ import annotations
 
@@ -65,14 +65,28 @@ class UnitreeL2PatternCfg:
     arc_angle_coefficients: tuple[float, ...] = (78.98, 10.92)  # angle along the arc: 90 + c1 x + c3 x^3 deg
     message_period: float = 0.0649  # s, 15.4 Hz
 
-    min_range: float = 0.2
+    min_range: float = 0.3  # the robot's L2 returns almost nothing closer
     dropout_probability: float = 0.0034
-    range_noise_std_per_meter: float = 0.0045
-    range_noise_std_range: tuple[float, float] = (0.001, 0.006)
+    # noise and systematic error measured against the floor in the rosbags of 5/11, 6/11 and 11/11
+    range_noise_std_per_meter: float = 0.035
+    range_noise_std_range: tuple[float, float] = (0.014, 0.022)
     range_resolution: float = 0.001
-    # systematic error a sin(2 pi d / wavelength + phase), drawn at every reset
-    range_bias_amplitude_range: tuple[float, float] = (0.0, 0.04)
-    range_bias_wavelength_range: tuple[float, float] = (0.1, 0.5)
+    # systematic error (m) at the true distance, every range_bias_profile_step m from range_bias_profile_start, zero
+    # past the table; scaled, shifted in distance and offset at every reset
+    range_bias_profile: tuple[float, ...] = (
+        0.058, 0.058, 0.103, 0.102, 0.071, 0.030, 0.018, 0.050, 0.084, 0.084, 0.037, 0.007, 0.002, 0.022, 0.038,
+        0.008, -0.024, -0.029, -0.027, -0.022, -0.016, -0.028, -0.035, -0.033, -0.014, -0.002, -0.010, -0.022, -0.023,
+        -0.007, -0.006, -0.016, -0.020, -0.006, -0.001, -0.008, -0.014, 0.022, 0.034, 0.037, 0.013, 0.006, 0.006,
+        0.004, 0.007,
+    )
+    range_bias_profile_start: float = 0.305
+    range_bias_profile_step: float = 0.02
+    range_bias_scale_range: tuple[float, float] = (0.8, 1.2)
+    range_bias_shift_range: tuple[float, float] = (-0.015, 0.015)
+    range_bias_offset_range: tuple[float, float] = (-0.01, 0.01)
+    # plus a smaller error a sin(2 pi d / wavelength + phase), drawn at every reset
+    range_bias_amplitude_range: tuple[float, float] = (0.0, 0.01)
+    range_bias_wavelength_range: tuple[float, float] = (0.08, 0.15)
     # each ray cast from the pose at its firing time (points are not motion compensated on the robot)
     simulate_motion_distortion: bool = True
 
@@ -102,6 +116,10 @@ class _UnitreeL2LidarMixin:
 
         self._offset_quat_l2 = torch.tensor(list(self.cfg.offset.rot), device=device).repeat(self.num_rays, 1)
         self._scanner_clock = torch.zeros(num_envs, dtype=torch.float64, device=device)
+        self._range_bias_profile = torch.tensor(self.cfg.pattern_cfg.range_bias_profile, device=device)
+        self._range_bias_scale = torch.zeros(num_envs, device=device)
+        self._range_bias_shift = torch.zeros(num_envs, device=device)
+        self._range_bias_offset = torch.zeros(num_envs, device=device)
         self._range_bias_amplitude = torch.zeros(num_envs, device=device)
         self._range_bias_wavenumber = torch.zeros(num_envs, device=device)
         self._range_bias_phase = torch.zeros(num_envs, device=device)
@@ -120,6 +138,10 @@ class _UnitreeL2LidarMixin:
         pattern_cfg = self.cfg.pattern_cfg
         num_envs = len(env_ids)
         self._scanner_clock[env_ids] = 1000.0 * torch.rand(num_envs, dtype=torch.float64, device=self._device)
+        for name in ("scale", "shift", "offset"):
+            getattr(self, f"_range_bias_{name}")[env_ids] = math_utils.sample_uniform(
+                *getattr(pattern_cfg, f"range_bias_{name}_range"), (num_envs,), device=self._device
+            )
         self._range_bias_amplitude[env_ids] = math_utils.sample_uniform(
             *pattern_cfg.range_bias_amplitude_range, (num_envs,), device=self._device
         )
@@ -199,8 +221,14 @@ class _UnitreeL2LidarMixin:
         distance = torch.where(hit, distance, 0.0)
 
         noise_std = (pattern_cfg.range_noise_std_per_meter * distance).clamp(*pattern_cfg.range_noise_std_range)
-        bias = self._range_bias_amplitude[env_ids, None] * torch.sin(
-            self._range_bias_wavenumber[env_ids, None] * distance + self._range_bias_phase[env_ids, None]
+        profile = range_bias(
+            self._range_bias_profile, pattern_cfg, distance + self._range_bias_shift[env_ids, None]
+        )
+        bias = (
+            self._range_bias_scale[env_ids, None] * profile
+            + self._range_bias_offset[env_ids, None]
+            + self._range_bias_amplitude[env_ids, None]
+            * torch.sin(self._range_bias_wavenumber[env_ids, None] * distance + self._range_bias_phase[env_ids, None])
         )
         measured = distance + bias + noise_std * torch.randn_like(distance)
         if pattern_cfg.range_resolution > 0.0:
@@ -209,6 +237,7 @@ class _UnitreeL2LidarMixin:
         valid = (
             in_message
             & hit
+            & (distance >= pattern_cfg.min_range)
             & (measured >= pattern_cfg.min_range)
             & (torch.rand_like(distance) >= pattern_cfg.dropout_probability)
         ).unsqueeze(-1)
@@ -217,6 +246,15 @@ class _UnitreeL2LidarMixin:
         self.points_l2[env_ids] = torch.where(valid, measured * ray_directions_l2, math.inf)
         self.point_times[env_ids] = point_times.float()
         self.point_valid[env_ids] = valid.squeeze(-1)
+
+
+def range_bias(profile: torch.Tensor, cfg: UnitreeL2PatternCfg, distance: torch.Tensor) -> torch.Tensor:
+    """The measured systematic range error at a true distance: linear in the table, zero past its end."""
+    x = ((distance - cfg.range_bias_profile_start) / cfg.range_bias_profile_step).clamp(min=0.0)
+    i = x.floor().long().clamp(max=len(profile) - 2)
+    w = (x - i).clamp(max=1.0)
+    value = profile[i] * (1.0 - w) + profile[i + 1] * w
+    return torch.where(x > len(profile) - 1, 0.0, value)
 
 
 def _rotate(rotation: torch.Tensor, vectors: torch.Tensor) -> torch.Tensor:

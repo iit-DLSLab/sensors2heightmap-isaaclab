@@ -12,6 +12,7 @@ HEIGHT_OFFSET = 0.5  # as in the policy heightmap: base z - ground z - 0.5
 CHANNELS = ("mean height", "min height", "max height", "points", "age")
 COUNT_SCALE = math.log1p(64.0)
 AGE_SCALE = 0.1
+NO_MESSAGE_AGE = 1.0  # s, the age of a grid without a message
 
 
 def grid_spec(heightmap: dict) -> dict:
@@ -91,3 +92,66 @@ def lidar_grid(
         (age / AGE_SCALE).view(-1, 1, 1).expand(num_robots, rows, cols),
     )
     return torch.stack(channels, dim=1)
+
+
+def window_input(
+    grids: Tensor, dt: Tensor, valid: Tensor, mode: str, grid: dict, poses: Tensor | None = None
+) -> Tensor:
+    """Sensor input from the grids of the last K messages, the current one last.
+
+    grids (N, K, 5, rows, cols); dt (N, K) seconds from each message to the current one; valid (N, K) False where there
+    was no message yet. stacked: the K grids as they are, (N, 5 K, rows, cols), the network aligns them. aligned: the
+    older grids moved into the current one with the base poses (N, K, 4: x, y, z, yaw, from the odometry) and merged
+    into one grid (N, 5, rows, cols)."""
+    age, points = CHANNELS.index("age"), CHANNELS.index("points")
+    grids = grids.clone()
+    grids[:, :, age] += (dt / AGE_SCALE)[..., None, None]
+    empty = torch.zeros_like(grids[:, :1])
+    empty[:, :, age] = NO_MESSAGE_AGE / AGE_SCALE
+    grids = torch.where(valid[..., None, None, None], grids, empty)
+    if mode == "stacked":
+        return grids.flatten(1, 2)
+    if mode != "aligned":
+        raise ValueError(f"Unknown window mode: {mode}")
+
+    num, k, channels, rows, cols = grids.shape
+    resolution, (x_min, _), (y_min, _) = grid["resolution"], grid["x_range"], grid["y_range"]
+    yaw = poses[:, -1, 3:4]
+    shift = poses[:, :-1, :3] - poses[:, -1:, :3]  # older bases from the current one, world axes
+    d_x = torch.cos(yaw) * shift[..., 0] + torch.sin(yaw) * shift[..., 1]
+    d_y = -torch.sin(yaw) * shift[..., 0] + torch.cos(yaw) * shift[..., 1]
+    d_z, turn = shift[..., 2], yaw - poses[:, :-1, 3]
+    # centres of the current cells in the frame of each older message: R(turn) (x - d)
+    x = x_min + resolution * (torch.arange(cols, device=grids.device) + 0.5)
+    y = y_min + resolution * (torch.arange(rows, device=grids.device) + 0.5)
+    x, y = x.view(1, 1, 1, cols) - d_x[..., None, None], y.view(1, 1, rows, 1) - d_y[..., None, None]
+    cos, sin = torch.cos(turn)[..., None, None], torch.sin(turn)[..., None, None]
+    col = torch.floor((cos * x - sin * y - x_min) / resolution).long()
+    row = torch.floor((sin * x + cos * y - y_min) / resolution).long()
+    inside = (col >= 0) & (col < cols) & (row >= 0) & (row < rows)
+    index = (row.clamp(0, rows - 1) * cols + col.clamp(0, cols - 1)).flatten(2)
+    older = grids[:, :-1].flatten(3).gather(3, index[:, :, None].expand(-1, -1, channels, -1))
+    older = older.view(num, k - 1, channels, rows, cols)
+    older = torch.where(inside[:, :, None], older, empty)
+    hit = older[:, :, points] > 0
+    moved = (older[:, :, :points] - d_z[..., None, None, None]).clip(-1.0, 1.0)  # heights from the current base
+    older[:, :, :points] = torch.where(hit[:, :, None], moved, 0.0)
+
+    stack = torch.cat((older, grids[:, -1:]), dim=1)
+    count = torch.expm1(stack[:, :, points] * COUNT_SCALE)
+    hit = count > 0.5
+    total = count.sum(dim=1)
+    merged = torch.stack(
+        (
+            (count * stack[:, :, 0]).sum(dim=1) / total.clamp(min=1.0),
+            torch.where(hit, stack[:, :, 1], math.inf).amin(dim=1),
+            torch.where(hit, stack[:, :, 2], -math.inf).amax(dim=1),
+            torch.log1p(total) / COUNT_SCALE,
+            torch.where(hit, stack[:, :, age], math.inf).amin(dim=1),
+        ),
+        dim=1,
+    )
+    seen = total > 0.5
+    merged[:, 1:3] = torch.where(seen[:, None], merged[:, 1:3], 0.0)
+    merged[:, age] = torch.where(seen, merged[:, age], grids[:, -1, age])
+    return merged

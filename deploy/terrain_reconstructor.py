@@ -15,7 +15,9 @@ from pathlib import Path
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import robots  # noqa: E402
 from sensors import lidar_grid  # noqa: E402
+from sensors.odometry import Odometry  # noqa: E402
 
 
 def decimate_depth(depth: torch.Tensor, height: int, width: int, min_valid_fraction: float = 0.5) -> torch.Tensor:
@@ -35,7 +37,10 @@ def decimate_depth(depth: torch.Tensor, height: int, width: int, min_valid_fract
 
 
 class TerrainReconstructor:
-    def __init__(self, path: str | Path, joint_names: list[str], device: str = "cpu"):
+    """empty_zone: (x_min, x_max) m, the LiDAR grid cells in this band (whole width) emptied before the network."""
+
+    def __init__(self, path: str | Path, joint_names: list[str], device: str = "cpu",
+                 empty_zone: tuple[float, float] | None = None):
         extra_files = {"config.json": ""}
         self.model = torch.jit.load(str(path), map_location=device, _extra_files=extra_files)
         self.config = json.loads(extra_files["config.json"])
@@ -46,11 +51,20 @@ class TerrainReconstructor:
         self.default_joint_pos = torch.tensor(proprio["default_joint_pos"], device=device)
         self.kind = self.config["sensor"]
         self.step_on_message = self.config.get("step_on_message", False)  # else at every control step
+        window = self.config.get("lidar_window", {"messages": 1, "mode": "aligned"})
+        self.window, self.window_mode = window["messages"], window["mode"]
+        if self.window > 1 and not self.step_on_message:
+            raise ValueError(f"{path}: a window of LiDAR messages needs a reconstructor that steps at every message.")
+        self.empty = None
         if self.kind == "lidar":
             self.message_period = self.config["lidar"]["message_period"]
             position, quat_xyzw = self.config["lidar"]["mount"]
             self.rotation = lidar_grid.rotation_matrix(quat_xyzw, device)
             self.position = torch.tensor(position, device=device)
+            if empty_zone is not None:
+                grid = self.config["lidar"]["grid"]
+                x = grid["x_range"][0] + grid["resolution"] * (torch.arange(grid["shape"][1], device=device) + 0.5)
+                self.empty = ((x >= empty_zone[0]) & (x < empty_zone[1]))[None, :].expand(*grid["shape"])
         self.reset()
         if torch.device(device).type == "cuda":
             self._warm_up()
@@ -74,6 +88,16 @@ class TerrainReconstructor:
         self.message_end = None
         if self.kind == "depth":
             self.depth = torch.zeros(1, 1, *self.config["depth"]["image_size"], device=self.device)
+        if self.window > 1:  # the last messages, when they arrived and the base pose then (odometry)
+            grid = self.config["lidar"]["grid"]
+            self.grids = torch.zeros(1, self.window, len(grid["channels"]), *grid["shape"], device=self.device)
+            self.times = torch.zeros(1, self.window, dtype=torch.float64, device=self.device)  # s, monotonic clock
+            self.poses = torch.zeros(1, self.window, 4, device=self.device)
+            self.valid = torch.zeros(1, self.window, dtype=torch.bool, device=self.device)
+            self.odometry = Odometry(1, self.default_joint_pos, self.config["odometry"]["kinematics"],
+                                     self.config["step_dt"], self.device)
+            self.pose = torch.zeros(1, 4, device=self.device)
+            self.restart = True
         self.fresh = True
 
     def sensor_message(self, data, stamp: float) -> None:
@@ -96,6 +120,9 @@ class TerrainReconstructor:
                            tensor(joint_position)[self.joint_order] - self.default_joint_pos,
                            tensor(joint_velocity)[self.joint_order]))
         self.history = torch.cat((self.history[1:], frame[None]))
+        if self.window > 1:
+            self.pose = self.odometry.step(frame[None], torch.tensor([self.restart], device=self.device))
+            self.restart = False
 
     def step(self, angular_velocity, projected_gravity, joint_position, joint_velocity, now: float) -> torch.Tensor:
         """Proprioception and prediction together, for a reconstructor that steps at every control step."""
@@ -107,10 +134,22 @@ class TerrainReconstructor:
         """One step of the network: the last sensor message and the proprioception history."""
         if self.kind == "lidar":
             age = now - self.message_end if self.message_end is not None else 1.0
+            grid = self.config["lidar"]["grid"]
             sensor_input = lidar_grid.lidar_grid(
                 self.points, self.gravity[None], torch.tensor([age], dtype=torch.float32, device=self.device),
-                self.rotation, self.position, self.config["lidar"]["grid"],
+                self.rotation, self.position, grid,
             )
+            if self.empty is not None:
+                sensor_input[:, :4, self.empty] = 0.0
+            if self.window > 1:  # called once per message: the message goes into the window
+                shifted = lambda buffer, new: torch.cat((buffer[:, 1:], new[:, None]), dim=1)  # noqa: E731
+                self.grids = shifted(self.grids, sensor_input)
+                self.times = shifted(self.times, torch.tensor([now], dtype=torch.float64, device=self.device))
+                self.poses = shifted(self.poses, self.pose)
+                self.valid = shifted(self.valid, torch.ones(1, dtype=torch.bool, device=self.device))
+                poses = self.poses if self.window_mode == "aligned" else None
+                sensor_input = lidar_grid.window_input(self.grids, (now - self.times).float(), self.valid,
+                                                       self.window_mode, grid, poses)
         else:
             sensor_input = self.depth
         heights, hidden = self.model(sensor_input, self.history.reshape(1, -1), self.hidden)
@@ -148,7 +187,7 @@ def export(checkpoint_path: str, output_path: str) -> None:
     hidden_dim = model.memory.hidden_size
     kind = model_config["sensor"]
     if kind == "lidar":
-        input_shape = (len(metadata["lidar_grid"]["channels"]), *metadata["lidar_grid"]["shape"])
+        input_shape = (model_config["depth_channels"], *metadata["lidar_grid"]["shape"])
     else:
         input_shape = (1, *metadata["depth_image_size"])
     example = (torch.zeros(1, *input_shape), torch.zeros(1, model_config["proprio_dim"]), torch.zeros(1, 1, hidden_dim))
@@ -176,6 +215,9 @@ def export(checkpoint_path: str, output_path: str) -> None:
     if kind == "lidar":
         config["lidar"] = {"grid": metadata["lidar_grid"], "mount": metadata["sensor_mount"],
                            "message_period": metadata["lidar_message_period"]}
+        config["lidar_window"] = checkpoint.get("lidar_window", {"messages": 1, "mode": "aligned"})
+        if config["lidar_window"]["messages"] > 1:
+            config["odometry"] = {"kinematics": robots.load(metadata["robot"]).LEG_KINEMATICS}
     else:
         config["depth"] = {"image_size": metadata["depth_image_size"], "max_range": metadata["depth_max_range"]}
     torch.jit.save(traced, output_path, _extra_files={"config.json": json.dumps(config)})
