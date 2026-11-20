@@ -1,4 +1,12 @@
+<div align="center">
+
 # sensors2heightmap-isaaclab
+
+![Video](https://img.shields.io/badge/Video-coming%20soon-lightgrey.svg)
+[![Isaac Lab](https://img.shields.io/badge/IsaacLab-3.0.0-green.svg)](https://github.com/isaac-sim/IsaacLab/releases/tag/v3.0.0)
+[![License](https://img.shields.io/badge/license-BSD--3--Clause-blue.svg)](LICENSE)
+
+</div>
 
 ## Overview
 
@@ -22,7 +30,7 @@ deploy/          TorchScript export and ROS 2 node
 example_policy/  Go2 vision policy to collect data with
 ```
 
-Requires Isaac Lab with [basic-locomotion-isaaclab](https://github.com/iit-DLSLab/basic-locomotion-isaaclab) (main).
+Requires [Isaac Lab 3.0.0](https://github.com/isaac-sim/IsaacLab/releases/tag/v3.0.0) with [basic-locomotion-isaaclab](https://github.com/iit-DLSLab/basic-locomotion-isaaclab) (main).
 Run everything from the repository root with Isaac Lab's Python.
 
 ## Usage
