@@ -25,7 +25,6 @@ def decimate_depth(depth: torch.Tensor, height: int, width: int, min_valid_fract
     factor = depth.shape[0] // height
     if factor < 1 or depth.shape[1] // width < factor:
         raise ValueError(f"A {depth.shape[1]}x{depth.shape[0]} depth image does not decimate to {width}x{height}.")
-    # crop the extra rows and columns on the top left, where the right imager doesn't see
     depth = depth[depth.shape[0] - factor * height :, depth.shape[1] - factor * width :]
     size = factor * factor
     blocks = depth.reshape(height, factor, width, factor).transpose(1, 2).reshape(height, width, size)
@@ -37,8 +36,6 @@ def decimate_depth(depth: torch.Tensor, height: int, width: int, min_valid_fract
 
 
 class TerrainReconstructor:
-    """empty_zone: (x_min, x_max) m, the LiDAR grid cells in this band (whole width) emptied before the network."""
-
     def __init__(self, path: str | Path, joint_names: list[str], device: str = "cpu",
                  empty_zone: tuple[float, float] | None = None):
         extra_files = {"config.json": ""}
@@ -70,8 +67,6 @@ class TerrainReconstructor:
             self._warm_up()
 
     def _warm_up(self, steps: int = 3) -> None:
-        """The first CUDA calls take ~0.2 s (cuDNN, kernels): spent here, not at the first message."""
-        # the traced GRU has no flatten_parameters(): cuDNN compacts its weights at every call, cheap at this size
         warnings.filterwarnings("ignore", message="RNN module weights are not part of single contiguous chunk")
         joints = torch.zeros(self.num_message_joints)
         for _ in range(steps):
@@ -110,8 +105,6 @@ class TerrainReconstructor:
             self.depth = decimate_depth(data, *depth["image_size"]).clip(0.0, depth["max_range"])[None, None]
 
     def proprio(self, angular_velocity, projected_gravity, joint_position, joint_velocity) -> None:
-        """One control step of proprioception into the history (always at the control step of training)."""
-
         def tensor(value) -> torch.Tensor:
             return torch.as_tensor(value, dtype=torch.float32, device=self.device).flatten()
 
@@ -153,7 +146,7 @@ class TerrainReconstructor:
         else:
             sensor_input = self.depth
         heights, hidden = self.model(sensor_input, self.history.reshape(1, -1), self.hidden)
-        if self.fresh:  # as in training, the memory starts from the second step
+        if self.fresh: 
             self.fresh = False
             return torch.full_like(heights, self.config["flat_height"])
         self.hidden = hidden
@@ -162,7 +155,6 @@ class TerrainReconstructor:
 
 class _Step(torch.nn.Module):
     """One step with plain tensors in and out, for tracing."""
-
     def __init__(self, model: torch.nn.Module, mean: float, std: float):
         super().__init__()
         self.model, self.mean, self.std = model, mean, std
@@ -211,6 +203,14 @@ def export(checkpoint_path: str, output_path: str) -> None:
         "step_dt": metadata["step_dt"],
         "step_on_message": bool(checkpoint.get("step_on_message", False)),
         "checkpoint": str(Path(checkpoint_path).resolve()),
+        # what the model comes from, to reproduce it (not in the data of models before 2026-11-18)
+        "provenance": {
+            "datasets": metadata.get("dataset_directories"),
+            "sensor_cfg": metadata.get("sensor_cfg"),
+            "policy_md5": metadata.get("policy_md5"),
+            "data_versions": metadata.get("versions"),
+            "training_versions": checkpoint.get("versions"),
+        },
     }
     if kind == "lidar":
         config["lidar"] = {"grid": metadata["lidar_grid"], "mount": metadata["sensor_mount"],

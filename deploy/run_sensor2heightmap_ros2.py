@@ -136,7 +136,6 @@ class Sensor2HeightmapROS2(Node):
 
     def predict(self, now: float) -> None:
         heights = self.reconstructor.predict(now).cpu().numpy()
-        # PUBLISH_FREQUENCY on average, at most once per prediction, right after the one that is due
         due = self.publish_credit >= 1.0 - 1e-6
         self.publish_credit += self.publish_frequency * self.predict_dt - due
         if due:

@@ -1,7 +1,6 @@
 #!/bin/bash
 echo "Remember to run this file with: source ros2_localhost_connect.sh"
 
-# Profilo simulazione locale.
 export ROS_LOCALHOST_ONLY=1
 unset CYCLONEDDS_URI
 unset RMW_IMPLEMENTATION
