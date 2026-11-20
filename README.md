@@ -101,4 +101,4 @@ BSD 3-Clause, see [LICENSE](LICENSE).
 
 ## Citation
 
-If you use this code, please cite it with the metadata in [CITATION.cff](CITATION.cff) (GitHub: "Cite this repository" in the sidebar).
+If you use this code, please cite it using [CITATION.cff](CITATION.cff).
