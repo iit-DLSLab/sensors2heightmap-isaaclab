@@ -1,0 +1,23 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+type: software
+title: "sensors2heightmap-isaaclab: heightmap reconstruction from LiDAR and depth cameras for vision locomotion policies"
+abstract: >-
+  An Isaac Lab set of tools for heightmap reconstruction from a LiDAR or a
+  depth camera: a network predicts the heightmap of a vision locomotion
+  policy from the sensor and the robot's proprioception, so the policy runs
+  on the robot without a height scanner.
+authors:
+  - given-names: Valerio
+    family-names: Belli
+    email: valerio.belli@iit.it
+    affiliation: "Istituto Italiano di Tecnologia (IIT)"
+repository-code: "https://github.com/iit-DLSLab/sensors2heightmap-isaaclab"
+license: BSD-3-Clause
+keywords:
+  - legged robots
+  - heightmap reconstruction
+  - lidar
+  - depth camera
+  - Isaac Lab
+  - reinforcement learning

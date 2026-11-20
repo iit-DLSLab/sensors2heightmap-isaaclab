@@ -1,3 +1,5 @@
+# sensors2heightmap-isaaclab
+
 ## Overview
 
 An Isaac Lab set of tools for heightmap reconstruction from a LiDAR or a depth camera: a network predicts the
@@ -85,6 +87,10 @@ A trained L2 reconstructor for the example policy: `example_policy/go2/concurren
 
 BSD 3-Clause, see [LICENSE](LICENSE).
 
-## Maintainers
+## Author
 
-- Valerio Belli (valerio.belli@iit.it)
+- Valerio Belli, developer and maintainer (valerio.belli@iit.it)
+
+## Citation
+
+If you use this code, please cite it with the metadata in [CITATION.cff](CITATION.cff) (GitHub: "Cite this repository" in the sidebar).
