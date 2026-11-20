@@ -19,9 +19,17 @@ from torch.utils.data import DataLoader, Dataset, RandomSampler, Subset
 from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import provenance  # noqa: E402
 import robots  # noqa: E402
 from sensors import lidar_grid  # noqa: E402
 from sensors.odometry import Odometry, odometry  # noqa: E402
+
+TEST_WARMUP_STEPS = 49  
+NON_FLAT_STD_THRESHOLD_M = 0.01  # a heightmap with a larger std counts as terrain
+FRAME_KEYS = {"depth": "depth_data", "lidar": "lidar_grid"}
+FUSION_MODULES = ("frame_reduction", "step_mlp")
+PROPRIO_NOISE_TERMS = ("base_ang_vel", "projected_gravity", "joint_pos", "joint_vel")
+MEMORY_AGE_BINS = ((0, 10), (10, 25), (25, 50), (50, 100), (100, 200), (200, 100_000))
 
 
 def _make_group_norm(num_channels: int) -> nn.GroupNorm:
@@ -257,15 +265,8 @@ class RecurrentTerrainReconstructor(nn.Module):
         )
 
 
-FUSION_MODULES = ("frame_reduction", "step_mlp")
-
-
 def build_terrain_reconstructor(model_config: dict) -> nn.Module:
     return RecurrentTerrainReconstructor(**model_config)
-
-
-PROPRIO_NOISE_TERMS = ("base_ang_vel", "projected_gravity", "joint_pos", "joint_vel")
-
 
 class ProprioNoise:
     """IMU and joint noise on a proprioception history: white noise per reading plus a bias, with the
@@ -320,9 +321,6 @@ def task_proprio_noise(metadata: dict) -> ProprioNoise | None:
     return ProprioNoise(observation_noise_std, len(metadata["proprio_joint_names"]), metadata["proprio_history"])
 
 
-TEST_WARMUP_STEPS = 49  # the first second of each episode is not scored
-
-
 def compute_reconstruction_losses(
     prediction: TerrainReconstructionOutput, target_heightmap: Tensor, rough_loss_type: str = "mse"
 ) -> dict[str, Tensor]:
@@ -339,10 +337,6 @@ def compute_reconstruction_losses(
         "rough_loss": rough_loss,
         "refined_loss": refined_loss,
     }
-
-
-FRAME_KEYS = {"depth": "depth_data", "lidar": "lidar_grid"}
-
 
 def message_steps(chunks: list[dict]) -> Tensor:
     """(steps, envs), True where a new LiDAR message arrived: the age channel of the grid drops."""
@@ -720,6 +714,7 @@ def run_terrain_reconstruction(
     step_on_message: bool = False,
     lidar_window: int = 1,
     lidar_window_mode: str = "aligned",
+    bag_eval: Sequence[str] | None = None,
 ) -> None:
     dataset_paths = [Path(p).expanduser().resolve() for p in ([path] if isinstance(path, (str, Path)) else path)]
     for dataset_path in dataset_paths:
@@ -731,6 +726,7 @@ def run_terrain_reconstruction(
         raise ValueError("The model trains on segments of consecutive steps: set segment_length > 1.")
 
     torch.manual_seed(0)
+    code_versions = provenance.versions()
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
     dataset = SequenceTerrainReconstructionDataset([str(p) for p in dataset_paths], segment_length, step_on_message,
@@ -839,6 +835,7 @@ def run_terrain_reconstruction(
                 "dataset_path": dataset_path_record,
                 "target_mean": target_normalization["mean"],
                 "target_std": target_normalization["std"],
+                "versions": code_versions,
                 **train_settings,
                 **{f"dataset/{key}": value for key, value in dataset.metadata.items()},
             },
@@ -894,31 +891,44 @@ def run_terrain_reconstruction(
             print(f"[INFO] Test MAE with the robot's proprioception noise {error.mean().item() * 1000:.2f} mm "
                   f"(non-flat {error[non_flat].mean().item() * 1000:.2f})")
 
-    torch.save(
-        {
-            "model_state_dict": {name: parameter.detach().cpu() for name, parameter in model.state_dict().items()},
-            "model_config": model_config,
-            "target_normalization": target_normalization,
-            "train_settings": train_settings,
-            "best_epoch": int(best_metrics["epoch"]),
-            "dataset_path": dataset_path_record,
-            "dataset_metadata": dataset.metadata,
-            "history": history,
-            "test_dataset_path": test_dataset_path,
-            "init_checkpoint": init_checkpoint,
-            "reinit_fusion": reinit_fusion,
-            "proprio_noise": proprio_noise,
-            "step_on_message": step_on_message,
-            "lidar_window": window_record,
-            "test_metrics": test_metrics,
-        },
-        output_path,
-    )
+    saved = {
+        "model_state_dict": {name: parameter.detach().cpu() for name, parameter in model.state_dict().items()},
+        "model_config": model_config,
+        "target_normalization": target_normalization,
+        "train_settings": train_settings,
+        "best_epoch": int(best_metrics["epoch"]),
+        "dataset_path": dataset_path_record,
+        "dataset_metadata": dataset.metadata,
+        "history": history,
+        "test_dataset_path": test_dataset_path,
+        "init_checkpoint": init_checkpoint,
+        "reinit_fusion": reinit_fusion,
+        "proprio_noise": proprio_noise,
+        "step_on_message": step_on_message,
+        "lidar_window": window_record,
+        "test_metrics": test_metrics,
+        "versions": code_versions,  # of the training, the data's are in dataset_metadata
+    }
+    torch.save(saved, output_path)
     resume_path.unlink(missing_ok=True)
     print(
         f"[INFO] Saved the terrain reconstructor (best epoch {int(best_metrics['epoch'])}, "
         f"val MAE {best_metrics['val_refined_mae_m'] * 1000:.2f} mm vs baseline {baseline_mae * 1000:.2f} mm) to: {output_path}"
     )
+
+    bag_metrics = {}
+    if bag_eval:
+        from deploy.terrain_reconstructor import export
+        from tested.bag_offset import evaluate, print_metrics
+
+        try:  
+            export(str(output_path), str(output_path.with_suffix(".ts")))
+            bag_metrics = evaluate(output_path.with_suffix(".ts"), bag_eval)
+            print_metrics(bag_metrics)
+            saved["bag_metrics"] = bag_metrics
+            torch.save(saved, output_path)
+        except Exception as error:  # noqa: BLE001
+            print(f"[ERROR] Rosbag evaluation failed: {error!r}")
 
     val_predictions = _predict(model, valid_loader, device, target_normalization, burn_in)
     val_target, val_prediction = val_predictions["target"], val_predictions["refined"]
@@ -947,13 +957,12 @@ def run_terrain_reconstruction(
         wandb_run.summary["best_epoch"] = int(best_metrics["epoch"])
         wandb_run.summary["best/val_refined_mae_m"] = best_metrics["val_refined_mae_m"]
         wandb_run.summary.update(split_metrics)
-        wandb_run.log({"heightmaps": _heightmap_comparison_figure(val_target, val_prediction, non_flat)}, step=num_epochs)
+        figure = _heightmap_comparison_figure(val_target, val_prediction, non_flat)
+        wandb_run.log({"heightmaps": figure, **bag_metrics}, step=num_epochs)
         wandb_run.summary.update(test_metrics)
+        wandb_run.summary.update(bag_metrics)
         wandb_run.summary["model_path"] = str(output_path)
         wandb_run.finish()
-
-
-NON_FLAT_STD_THRESHOLD_M = 0.01  # a heightmap with a larger std counts as terrain
 
 
 def heightmap_error_summary(ground_error: Tensor) -> dict[str, float]:
@@ -969,9 +978,6 @@ def heightmap_error_summary(ground_error: Tensor) -> dict[str, float]:
         "cells_too_low_5cm_pct": (ground_error < -0.05).float().mean().item() * 100,
         "steps_with_a_cell_off_5cm_pct": per_step_off.float().mean().item() * 100,
     }
-
-
-MEMORY_AGE_BINS = ((0, 10), (10, 25), (25, 50), (50, 100), (100, 200), (200, 100_000))
 
 
 def _evaluate_refiner_breakdown(model: nn.Module, predict: Callable[[], dict[str, Tensor]]) -> dict[str, float]:
@@ -1245,6 +1251,11 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--wandb", action="store_true", help="Log training metrics to Weights & Biases.")
     parser.add_argument("--wandb_project", type=str, default="sensors2heightmap", help="W&B project name.")
     parser.add_argument("--run_name", type=str, default=None, help="W&B run name.")
+    parser.add_argument(
+        "--bag_eval", type=str, nargs="+", default=None,
+        help="Robot rosbags: after training the model is exported next to --model_path (.ts) and its map is scored "
+        "against the stance feet on them (tested/bag_offset.py), logged as bag/... metrics.",
+    )
     return parser.parse_args()
 
 
@@ -1284,4 +1295,5 @@ if __name__ == "__main__":
         step_on_message=args.step_on_message,
         lidar_window=args.lidar_window,
         lidar_window_mode=args.lidar_window_mode,
+        bag_eval=args.bag_eval,
     )

@@ -62,9 +62,10 @@ class _SensorMount(dict):
 def attach_sensor(task: str, sensor_name: str, mount, robot_name: str, debug_vis: bool = False) -> None:
     """Mounts a sensor model on the task's robot (direct envs with a 'robot' articulation)."""
     robot = robots.load(robot_name)
-    sensor_cfg = sensors.load(sensor_name).sim_cfg(
-        robot.BASE_PRIM_PATH, *mount, robot.SENSORS[sensor_name]["meshes"]
-    )
+    spec = robot.SENSORS[sensor_name]
+    # where the rays start and the directions the body stops, if the robot's sensor has them
+    options = {key: spec[key] for key in ("optical_center", "occlusion_mask") if key in spec}
+    sensor_cfg = sensors.load(sensor_name).sim_cfg(robot.BASE_PRIM_PATH, *mount, spec["meshes"], **options)
     sensor_cfg.debug_vis = debug_vis
     env_class = gym.spec(task).entry_point
     if isinstance(env_class, str):
@@ -146,6 +147,7 @@ class ReconstructorInputs:
             "robot": robot_name,
             "sensor_mount": tuple(tuple(value) for value in mount),
             "sensor_errors": dict(errors),
+            "sensor_cfg": unwrapped.scene.sensors[SENSOR_NAME].cfg.to_dict(),  # the scan and its errors as simulated
             **self.sensor_input.metadata,
             **self.proprio.metadata,
         }

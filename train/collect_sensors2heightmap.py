@@ -99,6 +99,7 @@ import basic_locomotion_isaaclab.tasks  # noqa: F401
 from isaaclab_tasks.utils import get_checkpoint_path
 from isaaclab_tasks.utils.hydra import hydra_task_config
 
+import provenance
 import sim_helpers
 
 
@@ -222,6 +223,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         "step_dt": env.unwrapped.step_dt,
         "task": args_cli.task,
         "checkpoint_path": resume_path,
+        "policy_md5": provenance.md5(resume_path),
+        "versions": provenance.versions(),
         "seed": agent_cfg.seed,
         "heightmap_size": tuple(_get_heightmap_targets(env).shape[-2:]),
         "num_envs": env.unwrapped.num_envs,

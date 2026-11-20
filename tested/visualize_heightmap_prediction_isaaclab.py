@@ -139,8 +139,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     legend = sim_helpers.marker_legend(args_cli.draw, args_cli.show_ground_truth)
     print(f"[INFO] Loading terrain model: {model_path}")
     print(f"[INFO] Loading locomotion policy: {policy_checkpoint}")
+    on_message = checkpoint.get("step_on_message", False)  # else the reconstructor steps at every control step
     print(
-        f"[INFO] Inputs: {model_metadata['sensor_model']} and proprioception, one per step, memory restarted after each "
+        f"[INFO] Inputs: {model_metadata['sensor_model']} and proprioception, "
+        f"one per {'sensor message' if on_message else 'step'}, memory restarted after each "
         f"reset, commands: {model_metadata.get('commands', 'default')}, "
         f"policy walks on the {'predicted' if args_cli.closed_loop else 'true'} heightmap"
     )
@@ -207,13 +209,15 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             if clean_steps > 0:
                 if clean_steps == 1:
                     hidden_state = None
-                prediction = terrain_model(
-                    depth_data=frame[env_id][None, None],
-                    robot_info=proprio[env_id][None, None],
-                    hidden_state=hidden_state,
-                )
-                hidden_state = prediction.hidden_state
-                predicted = prediction.refined_heightmap[0, 0, 0] * normalization["std"] + normalization["mean"]
+                    predicted = torch.full(checkpoint["model_config"]["heightmap_size"], normalization["mean"], device=device)
+                if not on_message or inputs.sensor_input.new_message[env_id]:
+                    prediction = terrain_model(
+                        depth_data=frame[env_id][None, None],
+                        robot_info=proprio[env_id][None, None],
+                        hidden_state=hidden_state,
+                    )
+                    hidden_state = prediction.hidden_state
+                    predicted = prediction.refined_heightmap[0, 0, 0] * normalization["std"] + normalization["mean"]
                 errors.append(surface.update(env, env_id, predicted))
                 if viewport is not None and frames_written < args_cli.video_length:
                     frame = viewport.render_rgb_array()

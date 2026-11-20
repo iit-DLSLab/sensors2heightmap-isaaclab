@@ -1,10 +1,12 @@
-"""Unitree L2 LiDAR model. Scan pattern and timing identified from a Go2 rosbag"""
+"""Unitree L2 LiDAR model. Scan pattern, timing and range errorsidentified from several Go2 rosbag. 
+The rays start at the optical centre, the points are in the published cloud's frame, whose origin is the centre of the L2's bottom face (L2 user manual)."""
 
 from __future__ import annotations
 
 import math
 from collections.abc import Callable, Sequence
 
+import numpy as np
 import torch
 import warp as wp
 
@@ -14,6 +16,13 @@ from isaaclab.utils.configclass import configclass
 
 from . import lidar_grid
 from .sensor_model import SensorModel
+
+
+@configclass
+class CroppedRaycastTargetCfg(MultiMeshRayCasterCfg.RaycastTargetCfg):
+    """A raycast target without its faces whose centre lies beyond x_max (m, in the frame of its rigid body)."""
+
+    x_max: float = math.inf
 
 
 def unitree_l2_scan(
@@ -59,20 +68,24 @@ class UnitreeL2PatternCfg:
     func: Callable = unitree_l2_non_repetitive_pattern
 
     sample_period: float = 7.726e-6  # s between firings
-    samples_per_arc: int = 300  # horizon -> zenith -> opposite horizon
+    samples_per_arc: int = 300 
     arc_frequency: float = 215.83  # Hz
     rotation_speed: float = 1573.1  # deg/s of the head about z
     arc_angle_coefficients: tuple[float, ...] = (78.98, 10.92)  # angle along the arc: 90 + c1 x + c3 x^3 deg
     message_period: float = 0.0649  # s, 15.4 Hz
+    # the published cloud's origin is the centre of the L2's bottom (mounting) face, the laser leaves this far from it
+    # along its z (L2 user manual, 44.5 mm): rays start there, distances below are taken from the origin
+    optical_center_height: float = 0.0445
+    # where the rays start in the cloud's frame: (0, 0, optical_center_height), or a measured point (sim_cfg)
+    optical_center: tuple[float, float, float] = (0.0, 0.0, 0.0445)
+    occlusion_mask: str | None = None
 
-    min_range: float = 0.3  # the robot's L2 returns almost nothing closer
+    min_range: float = 0.3  # the Go2 drops the points closer than this to the cloud's origin
     dropout_probability: float = 0.0034
-    # noise and systematic error measured against the floor in the rosbags of 5/11, 6/11 and 11/11
+    # noise and systematic error measured against the floor in the rosbags
     range_noise_std_per_meter: float = 0.035
     range_noise_std_range: tuple[float, float] = (0.014, 0.022)
     range_resolution: float = 0.001
-    # systematic error (m) at the true distance, every range_bias_profile_step m from range_bias_profile_start, zero
-    # past the table; scaled, shifted in distance and offset at every reset
     range_bias_profile: tuple[float, ...] = (
         0.058, 0.058, 0.103, 0.102, 0.071, 0.030, 0.018, 0.050, 0.084, 0.084, 0.037, 0.007, 0.002, 0.022, 0.038,
         0.008, -0.024, -0.029, -0.027, -0.022, -0.016, -0.028, -0.035, -0.033, -0.014, -0.002, -0.010, -0.022, -0.023,
@@ -84,10 +97,8 @@ class UnitreeL2PatternCfg:
     range_bias_scale_range: tuple[float, float] = (0.8, 1.2)
     range_bias_shift_range: tuple[float, float] = (-0.015, 0.015)
     range_bias_offset_range: tuple[float, float] = (-0.01, 0.01)
-    # plus a smaller error a sin(2 pi d / wavelength + phase), drawn at every reset
     range_bias_amplitude_range: tuple[float, float] = (0.0, 0.01)
     range_bias_wavelength_range: tuple[float, float] = (0.08, 0.15)
-    # each ray cast from the pose at its firing time (points are not motion compensated on the robot)
     simulate_motion_distortion: bool = True
 
 
@@ -108,6 +119,37 @@ class _UnitreeL2LidarMixin:
             env_ids = torch.arange(self._view_count, device=self._device)
         self._sample_scanner_state(env_ids)
 
+    def _load_target_prim_warp_mesh(self, target_prim, target_cfg, reference_prim=None) -> int:
+        """Isaac Lab's loading; for a CroppedRaycastTargetCfg without the faces beyond its x_max, cached apart."""
+        from isaaclab.sensors.ray_caster import base_multi_mesh_ray_caster as base
+
+        x_max = getattr(target_cfg, "x_max", math.inf)
+        if not math.isfinite(x_max):
+            return super()._load_target_prim_warp_mesh(target_prim, target_cfg, reference_prim)
+        meshes = base.BaseMultiMeshRayCaster.meshes
+        key = (f"{target_prim.GetPath()}@{(reference_prim or target_prim).GetPath()}", self._device)
+        cropped_key = (f"{key[0]} x<{x_max}", key[1])
+        if cropped_key not in meshes:
+            convert, whole = base.convert_to_warp_mesh, meshes.pop(key, None)
+
+            def crop(points, indices, device):
+                keep = points[indices].mean(axis=1)[:, 0] < x_max
+                kept = points[np.unique(indices[keep])]
+                print(f"[INFO] {target_prim.GetPath()}: {keep.sum()} of {len(keep)} faces kept (x < {x_max} m), "
+                      f"x {kept[:, 0].min():+.3f}..{kept[:, 0].max():+.3f}, z {kept[:, 2].min():+.3f}.."
+                      f"{kept[:, 2].max():+.3f} m", flush=True)
+                return convert(points, indices[keep], device)
+
+            base.convert_to_warp_mesh = crop
+            try:
+                super()._load_target_prim_warp_mesh(target_prim, target_cfg, reference_prim)
+            finally:
+                base.convert_to_warp_mesh = convert
+            meshes[cropped_key] = meshes.pop(key)
+            if whole is not None:
+                meshes[key] = whole
+        return meshes[cropped_key].id
+
     def _initialize_rays_impl(self):
         super()._initialize_rays_impl()
         if self.cfg.ray_alignment != "base":
@@ -115,6 +157,12 @@ class _UnitreeL2LidarMixin:
         num_envs, device = self._view_count, self._device
 
         self._offset_quat_l2 = torch.tensor(list(self.cfg.offset.rot), device=device).repeat(self.num_rays, 1)
+        self._occlusion = None
+        if self.cfg.pattern_cfg.occlusion_mask:
+            data = np.load(self.cfg.pattern_cfg.occlusion_mask)
+            self._occlusion = tuple(torch.as_tensor(data[key], device=device) for key in ("mask", "theta", "phi"))
+            print(f"[INFO] L2 occlusion mask {self.cfg.pattern_cfg.occlusion_mask}: {int(data['mask'].sum())} of "
+                  f"{data['mask'].size} directions stopped by the body", flush=True)
         self._scanner_clock = torch.zeros(num_envs, dtype=torch.float64, device=device)
         self._range_bias_profile = torch.tensor(self.cfg.pattern_cfg.range_bias_profile, device=device)
         self._range_bias_scale = torch.zeros(num_envs, device=device)
@@ -216,34 +264,49 @@ class _UnitreeL2LidarMixin:
         ray_starts_w = wp.to_torch(self._ray_starts_w)[env_ids]
         ray_directions_w = wp.to_torch(self._ray_directions_w)[env_ids]
 
-        distance = torch.linalg.norm(ray_hits_w[env_ids] - ray_starts_w, dim=-1)
+        distance = torch.linalg.norm(ray_hits_w[env_ids] - ray_starts_w, dim=-1)  # from the optical centre
         hit = torch.isfinite(distance)
         distance = torch.where(hit, distance, 0.0)
+        # distances from the cloud's origin, as the robot's: the optical centre is at `center` in the cloud's frame
+        center = torch.tensor(pattern_cfg.optical_center, device=distance.device)
+        along = (ray_directions_l2 * center).sum(dim=-1)
 
-        noise_std = (pattern_cfg.range_noise_std_per_meter * distance).clamp(*pattern_cfg.range_noise_std_range)
+        def from_origin(d: torch.Tensor) -> torch.Tensor:
+            return torch.sqrt(d * d + 2.0 * d * along + center.dot(center))
+
+        true_distance = from_origin(distance)
+
+        noise_std = (pattern_cfg.range_noise_std_per_meter * true_distance).clamp(*pattern_cfg.range_noise_std_range)
         profile = range_bias(
-            self._range_bias_profile, pattern_cfg, distance + self._range_bias_shift[env_ids, None]
+            self._range_bias_profile, pattern_cfg, true_distance + self._range_bias_shift[env_ids, None]
         )
+        wave = self._range_bias_wavenumber[env_ids, None] * true_distance + self._range_bias_phase[env_ids, None]
         bias = (
             self._range_bias_scale[env_ids, None] * profile
             + self._range_bias_offset[env_ids, None]
-            + self._range_bias_amplitude[env_ids, None]
-            * torch.sin(self._range_bias_wavenumber[env_ids, None] * distance + self._range_bias_phase[env_ids, None])
+            + self._range_bias_amplitude[env_ids, None] * torch.sin(wave)
         )
-        measured = distance + bias + noise_std * torch.randn_like(distance)
+        measured = distance + bias + noise_std * torch.randn_like(distance)  # along the ray
         if pattern_cfg.range_resolution > 0.0:
             measured = torch.round(measured / pattern_cfg.range_resolution) * pattern_cfg.range_resolution
 
+        if self._occlusion is not None:  # the directions the robot's own body stops
+            mask, theta_edges, phi_edges = self._occlusion
+            theta = torch.rad2deg(torch.acos(ray_directions_l2[..., 2].clamp(-1.0, 1.0)))
+            phi = torch.rad2deg(torch.atan2(ray_directions_l2[..., 1], ray_directions_l2[..., 0]))
+            i = (torch.bucketize(theta.contiguous(), theta_edges.to(theta.dtype)) - 1).clamp(0, mask.shape[0] - 1)
+            j = (torch.bucketize(phi.contiguous(), phi_edges.to(phi.dtype)) - 1).clamp(0, mask.shape[1] - 1)
+            hit = hit & ~mask[i, j]
         valid = (
             in_message
             & hit
-            & (distance >= pattern_cfg.min_range)
-            & (measured >= pattern_cfg.min_range)
+            & (true_distance >= pattern_cfg.min_range)
+            & (from_origin(measured) >= pattern_cfg.min_range)
             & (torch.rand_like(distance) >= pattern_cfg.dropout_probability)
         ).unsqueeze(-1)
         measured = measured.unsqueeze(-1)
         ray_hits_w[env_ids] = torch.where(valid, ray_starts_w + measured * ray_directions_w, math.inf)
-        self.points_l2[env_ids] = torch.where(valid, measured * ray_directions_l2, math.inf)
+        self.points_l2[env_ids] = torch.where(valid, center + measured * ray_directions_l2, math.inf)
         self.point_times[env_ids] = point_times.float()
         self.point_valid[env_ids] = valid.squeeze(-1)
 
@@ -300,17 +363,31 @@ class UnitreeL2LidarModel(SensorModel):
     KIND = "lidar"
 
     @classmethod
-    def sim_cfg(cls, prim_path: str, position, rotation, meshes: Sequence[str]) -> MultiMeshRayCasterCfg:
+    def sim_cfg(cls, prim_path: str, position, rotation, meshes: Sequence[str | dict],
+                optical_center=None, occlusion_mask: str | None = None) -> MultiMeshRayCasterCfg:
+        """position, rotation: the frame of the published cloud, in which the points come out. optical_center: where
+        the rays start (m, base frame), by default optical_center_height along the cloud's z from its origin (L2
+        manual). meshes: prim expressions, or dicts of CroppedRaycastTargetCfg fields (prim_expr, x_max).
+        occlusion_mask: .npz of the directions the robot's body stops (UnitreeL2PatternCfg.occlusion_mask)."""
         pattern_cfg = UnitreeL2PatternCfg()
+        pattern_cfg.occlusion_mask = occlusion_mask
+        frame = lidar_grid.rotation_matrix(rotation).double()
+        origin = torch.tensor(position, dtype=torch.float64)
+        start = (origin + frame[:, 2] * pattern_cfg.optical_center_height if optical_center is None
+                 else torch.tensor(optical_center, dtype=torch.float64))
+        pattern_cfg.optical_center = tuple(float(v) for v in frame.T @ (start - origin))
+        optical_center = tuple(float(v) for v in start)
         return MultiMeshRayCasterCfg(
             class_type=UnitreeL2Lidar,
             prim_path=prim_path,
             update_period=pattern_cfg.message_period,
-            offset=MultiMeshRayCasterCfg.OffsetCfg(pos=tuple(position), rot=tuple(rotation)),
+            offset=MultiMeshRayCasterCfg.OffsetCfg(pos=optical_center, rot=tuple(rotation)),
             ray_alignment="base",
             pattern_cfg=pattern_cfg,
             mesh_prim_paths=[
-                "/World/ground", *[MultiMeshRayCasterCfg.RaycastTargetCfg(prim_expr=mesh) for mesh in meshes]
+                "/World/ground",
+                *[CroppedRaycastTargetCfg(**mesh) if isinstance(mesh, dict)
+                  else MultiMeshRayCasterCfg.RaycastTargetCfg(prim_expr=mesh) for mesh in meshes],
             ],
             max_distance=2.0,
             debug_vis=False,

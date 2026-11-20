@@ -12,7 +12,7 @@ HEIGHT_OFFSET = 0.5  # as in the policy heightmap: base z - ground z - 0.5
 CHANNELS = ("mean height", "min height", "max height", "points", "age")
 COUNT_SCALE = math.log1p(64.0)
 AGE_SCALE = 0.1
-NO_MESSAGE_AGE = 1.0  # s, the age of a grid without a message
+NO_MESSAGE_AGE = 1.0  # s, the age of a grid without a message. Warning and debugging purposes
 
 
 def grid_spec(heightmap: dict) -> dict:
@@ -97,12 +97,18 @@ def lidar_grid(
 def window_input(
     grids: Tensor, dt: Tensor, valid: Tensor, mode: str, grid: dict, poses: Tensor | None = None
 ) -> Tensor:
-    """Sensor input from the grids of the last K messages, the current one last.
+    """
+    This functions is still on WIP...It's an alternative approach to build the model. 
 
-    grids (N, K, 5, rows, cols); dt (N, K) seconds from each message to the current one; valid (N, K) False where there
-    was no message yet. stacked: the K grids as they are, (N, 5 K, rows, cols), the network aligns them. aligned: the
-    older grids moved into the current one with the base poses (N, K, 4: x, y, z, yaw, from the odometry) and merged
-    into one grid (N, 5, rows, cols)."""
+    Build model input from recent LiDAR grids, either stacked or pose-aligned.
+    
+    - Stacked mode concatenates the temporal window along the channel dimension;
+    
+    - Aligned mode resamples prior grids into the latest robot frame before fusion, 
+        the projection is performed computing the relative pose between the current 
+        robot frame and the previous ones, and then applying a rigid transformation 
+        to the grid coordinates. (Easy peasy)
+    """
     age, points = CHANNELS.index("age"), CHANNELS.index("points")
     grids = grids.clone()
     grids[:, :, age] += (dt / AGE_SCALE)[..., None, None]
