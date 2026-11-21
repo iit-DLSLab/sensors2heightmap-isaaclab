@@ -1,7 +1,14 @@
 """Runs the terrain reconstructor on the robot and publishes the heightmap on /height_scan_markers, the topic
 read by basic-locomotion's run_controller_ros2.py. Settings in deploy/config.py.
 
-    python deploy/run_sensor2heightmap_ros2.py --model <model>.ts [--robot go2]
+    python deploy/run_sensor2heightmap_ros2.py --model <model>.ts [--robot go2] [--relief_gain 1.3]
+
+The relief of the published map can be multiplied around the floor under the stance feet (deploy/config.py
+RELIEF_GAIN, --relief_gain), also while the node runs, without resetting the reconstructor:
+
+    ros2 param set /Sensor2HeightmapROS2 relief_gain 1.3
+
+The gain of every published map goes on /height_scan_relief_gain (std_msgs/Float32), for the bags.
 """
 
 import os
@@ -17,9 +24,11 @@ import numpy as np
 import rclpy
 import torch
 from dls2_interface.msg import BlindState, Imu
+from rcl_interfaces.msg import ParameterDescriptor, SetParametersResult
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import Image, PointCloud2
+from std_msgs.msg import Float32
 from visualization_msgs.msg import Marker, MarkerArray
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -27,18 +36,26 @@ import config as deploy_config  # noqa: E402  (deploy/config.py)
 import robots  # noqa: E402
 from sensors import lidar_grid  # noqa: E402
 from sensors.sensor_model import TOPICS  # noqa: E402
-from terrain_reconstructor import TerrainReconstructor  # noqa: E402
+from terrain_reconstructor import TerrainReconstructor, amplify_relief  # noqa: E402
+
+MAX_RELIEF_GAIN = 2.0
 
 
 class Sensor2HeightmapROS2(Node):
-    def __init__(self, model: str, robot: str, topic: str | None = None):
+    def __init__(self, model: str, robot: str, topic: str | None = None, relief_gain: float = 1.0):
         super().__init__("Sensor2HeightmapROS2")
         device = deploy_config.DEVICE
         if torch.device(device).type == "cuda" and not torch.cuda.is_available():
             self.get_logger().warning(f"deploy/config.py: DEVICE = {device!r}, but this torch has no CUDA: using the cpu")
             device = "cpu"
         empty_zone = getattr(deploy_config, "EMPTY_ZONE_X", None)
-        self.reconstructor = TerrainReconstructor(model, robots.load(robot).MESSAGE_JOINT_NAMES, device, empty_zone)
+        self.robot = robots.load(robot)
+        self.reconstructor = TerrainReconstructor(model, self.robot.MESSAGE_JOINT_NAMES, device, empty_zone)
+        if not 0.0 < relief_gain <= MAX_RELIEF_GAIN:
+            raise ValueError(f"relief gain {relief_gain}: it must be in (0, {MAX_RELIEF_GAIN}].")
+        self.relief_gain = relief_gain
+        self.declare_parameter("relief_gain", relief_gain, ParameterDescriptor(dynamic_typing=True))  # 1 as well as 1.0
+        self.add_on_set_parameters_callback(self._set_parameters)
         config = self.reconstructor.config
         self.imu = self.joints = None
         self.sensor_arrived = False
@@ -58,6 +75,7 @@ class Sensor2HeightmapROS2(Node):
         self.create_subscription(Imu, "/imu", self.imu_callback, 1)
         self.create_subscription(BlindState, "/blind_state_legged", self.joints_callback, 1)
         self.publisher_heightmap = self.create_publisher(MarkerArray, "/height_scan_markers", 1)
+        self.publisher_relief_gain = self.create_publisher(Float32, "/height_scan_relief_gain", 10)
         self.step_dt = config["step_dt"]  # proprioception, always at the control step of training
         on_message = self.reconstructor.step_on_message
         self.predict_dt = self.reconstructor.message_period if on_message else self.step_dt
@@ -79,7 +97,22 @@ class Sensor2HeightmapROS2(Node):
             + (f", window of {self.reconstructor.window} messages ({self.reconstructor.window_mode})"
                if self.reconstructor.window > 1 else "")
             + (f", grid cells at x {empty_zone[0]:+.2f}..{empty_zone[1]:+.2f} m emptied" if empty_zone else "")
+            + f", relief gain {self.relief_gain:g}"
         )
+
+    def _set_parameters(self, parameters) -> SetParametersResult:
+        for parameter in parameters:
+            if parameter.name != "relief_gain":
+                continue
+            try:
+                gain = float(parameter.value)
+            except (TypeError, ValueError):
+                return SetParametersResult(successful=False, reason="relief_gain must be a number")
+            if not 0.0 < gain <= MAX_RELIEF_GAIN:
+                return SetParametersResult(successful=False, reason=f"relief_gain must be in (0, {MAX_RELIEF_GAIN}]")
+            self.get_logger().info(f"relief gain {self.relief_gain:g} -> {gain:g}")
+            self.relief_gain = gain
+        return SetParametersResult(successful=True)
 
     def lidar_callback(self, msg):
         offsets = {field.name: field.offset for field in msg.fields}
@@ -135,11 +168,14 @@ class Sensor2HeightmapROS2(Node):
             self.predict(now)
 
     def predict(self, now: float) -> None:
-        heights = self.reconstructor.predict(now).cpu().numpy()
+        heights = self.reconstructor.predict(now)
         due = self.publish_credit >= 1.0 - 1e-6
         self.publish_credit += self.publish_frequency * self.predict_dt - due
         if due:
-            self.publish(heights, self._projected_gravity())
+            gravity, gain = self._projected_gravity(), self.relief_gain
+            heights = amplify_relief(heights.reshape(-1), self.joints[0], gravity, gain, self.robot)
+            self.publish(heights.cpu().numpy(), gravity)
+            self.publisher_relief_gain.publish(Float32(data=float(gain)))
 
     def publish(self, heights, projected_gravity):
         # cells in base_link: the controller adds the base pose and takes their z
@@ -168,13 +204,16 @@ if __name__ == "__main__":
     parser.add_argument("--model", required=True, help="Reconstructor exported by deploy/terrain_reconstructor.py (.ts).")
     parser.add_argument("--robot", default="go2", help="Robot, a module of robots/: the order of its joints.")
     parser.add_argument("--topic", default=None, help="Sensor topic, if not the default of the sensor kind.")
+    parser.add_argument("--relief_gain", type=float, default=getattr(deploy_config, "RELIEF_GAIN", 1.0),
+                        help="Relief of the published map multiplied around the floor under the stance feet "
+                             "(default: deploy/config.py RELIEF_GAIN). Also: ros2 param set /Sensor2HeightmapROS2 relief_gain <gain>.")
     parser.add_argument("--threads", type=int, default=1,
                         help="Torch threads. The controller shares the CPU: more threads slow both loops down.")
     args = parser.parse_args()
 
     torch.set_num_threads(args.threads)
     rclpy.init()
-    node = Sensor2HeightmapROS2(args.model, args.robot, args.topic)
+    node = Sensor2HeightmapROS2(args.model, args.robot, args.topic, args.relief_gain)
     rclpy.spin(node)
     node.destroy_node()
     rclpy.shutdown()

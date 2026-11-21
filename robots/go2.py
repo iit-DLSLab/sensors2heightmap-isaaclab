@@ -41,6 +41,7 @@ SENSORS = {
 
 # legs of the URDF (m): hip joints at (+-x, +-y) from the base, thigh joint offset sideways, thigh and calf lengths
 LEG_KINEMATICS = {"hip": (0.1934, 0.0465), "thigh_offset": 0.0955, "thigh": 0.213, "calf": 0.213}
+FOOT_RADIUS = 0.022  # m, the foot sphere: the ground is this far below the foot centre of LEG_KINEMATICS
 
 # order of the joints in /blind_state_legged
 MESSAGE_JOINT_NAMES = [f"{leg}_{joint}_joint" for leg in ("FL", "FR", "RL", "RR") for joint in ("hip", "thigh", "calf")]
