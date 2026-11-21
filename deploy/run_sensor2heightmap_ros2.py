@@ -55,7 +55,7 @@ class Sensor2HeightmapROS2(Node):
             raise ValueError(f"relief gain {relief_gain}: it must be in (0, {MAX_RELIEF_GAIN}].")
         self.relief_gain = relief_gain
         self.declare_parameter("relief_gain", relief_gain, ParameterDescriptor(dynamic_typing=True))  # 1 as well as 1.0
-        self.add_on_set_parameters_callback(self._set_parameters)
+        self.add_on_set_parameters_callback(self._on_set_parameters)
         config = self.reconstructor.config
         self.imu = self.joints = None
         self.sensor_arrived = False
@@ -100,7 +100,8 @@ class Sensor2HeightmapROS2(Node):
             + f", relief gain {self.relief_gain:g}"
         )
 
-    def _set_parameters(self, parameters) -> SetParametersResult:
+    # not _set_parameters: that is rclpy.Node's own method, which Node.__init__ calls
+    def _on_set_parameters(self, parameters) -> SetParametersResult:
         for parameter in parameters:
             if parameter.name != "relief_gain":
                 continue
