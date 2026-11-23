@@ -17,7 +17,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import robots  # noqa: E402
 from sensors import lidar_grid  # noqa: E402
-from sensors.odometry import Odometry, feet  # noqa: E402
+from sensors.odometry import Odometry  # noqa: E402
 
 
 def decimate_depth(depth: torch.Tensor, height: int, width: int, min_valid_fraction: float = 0.5) -> torch.Tensor:
@@ -33,21 +33,6 @@ def decimate_depth(depth: torch.Tensor, height: int, width: int, min_valid_fract
     low = blocks.gather(-1, (size - n + (n - 1).div(2, rounding_mode="floor")).clamp(max=size - 1))
     high = blocks.gather(-1, (size - n + n // 2).clamp(max=size - 1))
     return torch.where(n >= min_valid_fraction * size, 0.5 * (low + high), 0.0)[..., 0]
-
-
-def amplify_relief(heights: torch.Tensor, joint_position, projected_gravity, gain: float, robot) -> torch.Tensor:
-    """The map's relief multiplied by gain around the floor under the stance feet, so the ground the robot stands on
-    stays where it is and what is higher or lower than it moves away from it: a step 10 cm above the feet is drawn
-    13 cm above them with gain 1.3. The floor is under the three lowest feet (the joint angles, joint_position in the
-    order of robot.MESSAGE_JOINT_NAMES, leg by leg). heights as the policy's (base z - ground z - 0.5, in the
-    yaw-aligned frame)."""
-    if gain == 1.0:
-        return heights
-    gravity = torch.as_tensor(projected_gravity, dtype=torch.float32, device=heights.device).reshape(1, 3)
-    joints = torch.as_tensor(joint_position, dtype=torch.float32, device=heights.device).flatten()
-    feet_z = (feet(joints, robot.LEG_KINEMATICS) @ lidar_grid.yaw_frame(gravity)[0])[:, 2]
-    floor = -(feet_z.sort().values[:3].mean() - robot.FOOT_RADIUS) - lidar_grid.HEIGHT_OFFSET
-    return floor + gain * (heights - floor)
 
 
 class TerrainReconstructor:

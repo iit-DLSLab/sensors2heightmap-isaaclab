@@ -1,11 +1,17 @@
-"""Settings of the deploy, read by deploy/run_sensor2heightmap_ros2.py."""
+""" Settings of the deploy, read by deploy/run_sensor2heightmap_ros2.py."""
+
+## General parameters and Debugging 
 
 # Hz at which the heightmap is published on /height_scan_markers.
-PUBLISH_FREQUENCY = 16.0 #dont'change this unless you trained a new model with a different frequency
-
+PUBLISH_FREQUENCY = 16.0 # dont'change this unless you trained a new model with a different frequency
 DEVICE = "cuda"
-
 # It needs for debugging, don't change it unless you know what you are doing.
 EMPTY_ZONE_X = None
 
-RELIEF_GAIN = 1.2
+
+## Training parameters
+TEST_WARMUP_STEPS = 49
+NON_FLAT_STD_THRESHOLD_M = 0.01  # a heightmap with a larger std counts as terrain
+FRAME_KEYS = {"depth": "depth_data", "lidar": "lidar_grid"}
+FUSION_MODULES = {"frame_reduction", "step_mlp"}
+PROPRIO_NOISE_TERMS = {"base_ang_vel", "projected_gravity", "joint_pos", "joint_vel"}

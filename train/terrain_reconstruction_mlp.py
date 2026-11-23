@@ -17,19 +17,22 @@ from torch import Tensor, nn
 from torch.utils.checkpoint import checkpoint
 from torch.utils.data import DataLoader, Dataset, RandomSampler, Subset
 from tqdm import tqdm
+import config as deploy_config
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import provenance  # noqa: E402
 import robots  # noqa: E402
 from sensors import lidar_grid  # noqa: E402
 from sensors.odometry import Odometry, odometry  # noqa: E402
-
-TEST_WARMUP_STEPS = 49  
-NON_FLAT_STD_THRESHOLD_M = 0.01  # a heightmap with a larger std counts as terrain
-FRAME_KEYS = {"depth": "depth_data", "lidar": "lidar_grid"}
-FUSION_MODULES = ("frame_reduction", "step_mlp")
-PROPRIO_NOISE_TERMS = ("base_ang_vel", "projected_gravity", "joint_pos", "joint_vel")
+ 
 MEMORY_AGE_BINS = ((0, 10), (10, 25), (25, 50), (50, 100), (100, 200), (200, 100_000))
+BODY_CELLS = (slice(4, 7), slice(3, 8))  #
+
+TEST_WARMUP_STEPS = deploy_config.TEST_WARMUP_STEPS
+NON_FLAT_STD_THRESHOLD_M = deploy_config.NON_FLAT_STD_THRESHOLD_M
+FRAME_KEYS = deploy_config.FRAME_KEYS
+FUSION_MODULES = deploy_config.FUSION_MODULES
+PROPRIO_NOISE_TERMS = deploy_config.PROPRIO_NOISE_TERMS
 
 
 def _make_group_norm(num_channels: int) -> nn.GroupNorm:
@@ -321,21 +324,39 @@ def task_proprio_noise(metadata: dict) -> ProprioNoise | None:
     return ProprioNoise(observation_noise_std, len(metadata["proprio_joint_names"]), metadata["proprio_history"])
 
 
+def relief_weights(target_m: Tensor, relief_weight: float, threshold: float = 0.04) -> Tensor | None:
+    """Per-cell loss weights (..., 1, h, w): relief_weight where the true map is more than threshold (m) above or below
+    the floor under the body (the median of BODY_CELLS of the same map), 1 elsewhere. None for relief_weight 1."""
+    if relief_weight == 1.0:
+        return None
+    floor = target_m[..., BODY_CELLS[0], BODY_CELLS[1]].flatten(-2).median(dim=-1).values[..., None, None]
+    return 1.0 + (relief_weight - 1.0) * ((target_m - floor).abs() > threshold).float()
+
+
+def _weighted_mean(values: Tensor, weights: Tensor | None) -> Tensor:
+    return values.mean() if weights is None else (weights * values).sum() / weights.sum()
+
+
 def compute_reconstruction_losses(
-    prediction: TerrainReconstructionOutput, target_heightmap: Tensor, rough_loss_type: str = "mse"
+    prediction: TerrainReconstructionOutput, target_heightmap: Tensor, rough_loss_type: str = "mse",
+    weights: Tensor | None = None,
 ) -> dict[str, Tensor]:
+    """weights (from relief_weights, broadcastable to the maps): each cell's error counts that much; None = all 1."""
+    rough_error = prediction.rough_heightmap - target_heightmap
     if rough_loss_type == "l1":
-        rough_loss = F.l1_loss(prediction.rough_heightmap, target_heightmap)
+        rough_loss = _weighted_mean(rough_error.abs(), weights)
     elif rough_loss_type == "mse":
-        rough_loss = F.mse_loss(prediction.rough_heightmap, target_heightmap)
+        rough_loss = _weighted_mean(rough_error.square(), weights)
     else:
         raise ValueError(f"Unknown rough_loss_type: {rough_loss_type}")
-    refined_loss = F.l1_loss(prediction.refined_heightmap, target_heightmap)
+    refined_error = (prediction.refined_heightmap - target_heightmap).abs()
+    refined_loss = _weighted_mean(refined_error, weights)
     total_loss = rough_loss + refined_loss
     return {
         "loss": total_loss,
         "rough_loss": rough_loss,
         "refined_loss": refined_loss,
+        "refined_mae": refined_error.mean(),  # unweighted, in normalized units
     }
 
 def message_steps(chunks: list[dict]) -> Tensor:
@@ -522,6 +543,8 @@ def _run_epoch(
     burn_in: int = 0,
     max_grad_norm: float | None = None,
     proprio_noise: ProprioNoise | None = None,
+    relief_weight: float = 1.0,
+    relief_threshold: float = 0.04,
 ) -> dict[str, float]:
     is_training = optimizer is not None
     model.train(mode=is_training)
@@ -530,6 +553,7 @@ def _run_epoch(
     total_loss = 0.0
     total_rough_loss = 0.0
     total_refined_loss = 0.0
+    total_refined_mae = 0.0
     total_samples = 0
 
     progress = tqdm(data_loader, desc="train" if is_training else "val", leave=False, dynamic_ncols=True)
@@ -538,7 +562,9 @@ def _run_epoch(
         robot_info = batch[1].to(device)
         if proprio_noise is not None:
             robot_info = proprio_noise(robot_info, generator, batch[3].to(device))
-        target_heightmap = (batch[2].to(device) - target_mean) / target_std
+        target_m = batch[2].to(device)
+        target_heightmap = (target_m - target_mean) / target_std
+        weights = relief_weights(target_m[:, burn_in:], relief_weight, relief_threshold)
 
         if is_training:
             optimizer.zero_grad(set_to_none=True)
@@ -547,7 +573,8 @@ def _run_epoch(
             prediction = _segment_prediction(model, depth_data, robot_info, burn_in)
             target_heightmap = target_heightmap[:, burn_in:]
             losses = compute_reconstruction_losses(
-                prediction=prediction, target_heightmap=target_heightmap, rough_loss_type=rough_loss_type
+                prediction=prediction, target_heightmap=target_heightmap, rough_loss_type=rough_loss_type,
+                weights=weights,
             )
 
         if is_training:
@@ -561,13 +588,14 @@ def _run_epoch(
         total_loss += losses["loss"].item() * batch_size
         total_rough_loss += losses["rough_loss"].item() * batch_size
         total_refined_loss += losses["refined_loss"].item() * batch_size
+        total_refined_mae += losses["refined_mae"].item() * batch_size
         progress.set_postfix(loss=f"{total_loss / total_samples:.4f}")
 
     return {
         "loss": total_loss / max(total_samples, 1),
         "rough_loss": total_rough_loss / max(total_samples, 1),
-        "refined_loss": total_refined_loss / max(total_samples, 1),
-        "refined_mae_m": total_refined_loss / max(total_samples, 1) * target_std,
+        "refined_loss": total_refined_loss / max(total_samples, 1),  # weighted with relief_weight != 1
+        "refined_mae_m": total_refined_mae / max(total_samples, 1) * target_std,  # unweighted
     }
 
 
@@ -590,8 +618,11 @@ def train_terrain_reconstructor(
     resume_path: str | Path | None = None,
     resume_info: dict | None = None,
     proprio_noise: ProprioNoise | None = None,
+    relief_weight: float = 1.0,
+    relief_threshold: float = 0.04,
 ) -> list[dict[str, float]]:
-    """Training loop: cosine LR, best epoch restored, resumable."""
+    """Training loop: cosine LR, best epoch restored (on the validation refined loss, weighted as the training's),
+    resumable."""
     device = torch.device(device)
     model.to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
@@ -608,6 +639,8 @@ def train_terrain_reconstructor(
         burn_in=burn_in,
         max_grad_norm=max_grad_norm,
         proprio_noise=proprio_noise,
+        relief_weight=relief_weight,
+        relief_threshold=relief_threshold,
     )
 
     best_val_loss = float("inf")
@@ -715,6 +748,8 @@ def run_terrain_reconstruction(
     lidar_window: int = 1,
     lidar_window_mode: str = "aligned",
     bag_eval: Sequence[str] | None = None,
+    relief_weight: float = 1.0,
+    relief_threshold: float = 0.04,
 ) -> None:
     dataset_paths = [Path(p).expanduser().resolve() for p in ([path] if isinstance(path, (str, Path)) else path)]
     for dataset_path in dataset_paths:
@@ -794,6 +829,8 @@ def run_terrain_reconstruction(
         "burn_in": burn_in,
         "max_grad_norm": 1.0,
     }
+    if relief_weight != 1.0:  # kept out otherwise: the settings of the earlier models stay as they were
+        train_settings.update(relief_weight=relief_weight, relief_threshold=relief_threshold)
 
     output_path = Path(model_path) if model_path else dataset_path.with_name("terrain_reconstructor.pt")
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1252,6 +1289,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--wandb_project", type=str, default="sensors2heightmap", help="W&B project name.")
     parser.add_argument("--run_name", type=str, default=None, help="W&B run name.")
     parser.add_argument(
+        "--relief_weight", type=float, default=1.0,
+        help="Loss weight of the cells more than --relief_threshold above or below the floor under the body (the "
+        "median of the true map's cells under it); 1: every cell counts the same (the earlier models).",
+    )
+    parser.add_argument("--relief_threshold", type=float, default=0.04, help="m, see --relief_weight.")
+    parser.add_argument(
         "--bag_eval", type=str, nargs="+", default=None,
         help="Robot rosbags: after training the model is exported next to --model_path (.ts) and its map is scored "
         "against the stance feet on them (tested/bag_offset.py), logged as bag/... metrics.",
@@ -1296,4 +1339,6 @@ if __name__ == "__main__":
         lidar_window=args.lidar_window,
         lidar_window_mode=args.lidar_window_mode,
         bag_eval=args.bag_eval,
+        relief_weight=args.relief_weight,
+        relief_threshold=args.relief_threshold,
     )
