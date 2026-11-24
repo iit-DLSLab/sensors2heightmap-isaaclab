@@ -27,7 +27,7 @@ robots/          sensor mounts and joint order per robot (see robots/README.md)
 train/           data collection and training
 tested/          closed-loop evaluation, visualization, keyboard teleop
 deploy/          TorchScript export and ROS 2 node
-example_policy/  Go2 vision policy to collect data with
+example_policy/  Go2 vision policy to collect data with and a trained reconstructor model
 ```
 
 Requires [Isaac Lab 3.0.0](https://github.com/isaac-sim/IsaacLab/releases/tag/v3.0.0) with [basic-locomotion-isaaclab](https://github.com/iit-DLSLab/basic-locomotion-isaaclab) (main).
@@ -45,17 +45,12 @@ python train/collect_sensors2heightmap.py --task=Locomotion-Go2-Rough-Vision --n
   --dataset_path=<data>/lidar_fwd_train_seed42
 ```
 
-Train. The defaults are the reference recipe (`l2_relief_w3`): one step per LiDAR message (~15 Hz, proprioception at
-50 Hz) with the robot's IMU and joint noise, segments of 32 messages, 200 epochs, loss x3 on cells more than 4 cm off
-the floor under the body. The `.ts` is exported next to the `.pt`; `--bag_eval <rosbags>` also scores it on robot bags.
+Train (the defaults are the reference recipe, `l2_relief_w3`; the `.ts` is exported next to the `.pt`):
 
 ```bash
 python train/terrain_reconstruction_mlp.py --dataset_path <data>/lidar_*train_seed* \
   --test_dataset_path <data>/lidar_*test_seed* --model_path <models>/lidar.pt --wandb
 ```
-
-`--lidar_window 3` gives the network the last 3 LiDAR messages: `--lidar_window_mode aligned` moves the older ones into
-the current grid with the odometry from the proprioception (`sensors/odometry.py`), `stacked` passes them as they are.
 
 Test in simulation:
 
