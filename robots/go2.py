@@ -27,9 +27,11 @@ SENSORS = {
     # L2 positions are based on the user manual by Unitree; the published cloud frame was estimated from the rosbags.
     # Again, do not change anything here unless you have an idea of what you are doing.
     "unitree_l2_lidar": {
-        "position": (0.28945, 0.0, 0.045),
+        "position": (0.28945, 0.0, 0.035),
         "rotation": (-0.8579, 0.4977, -0.1167, 0.0520),
         "meshes": LEG_MESHES,  # the trunk would stop the rays, see TRUNK_MESH
+        "occlusion_mask": L2_OCCLUSION_MASK,
+        "optical_center": (0.300, 0.0, -0.04),
     },
     # 20 deg down, ROS optical frame
     "realsense_d435": {

@@ -9,3 +9,10 @@ terrain_reconstruction_sequences/
 deploy/ros2_ws/build/
 deploy/ros2_ws/install/
 deploy/ros2_ws/log/
+
+# local VS Code settings (paths of this machine)
+.vscode/
+l2_real.sh
+
+example_policy/go2/concurrent_se_vision/reconstructor/*
+!example_policy/go2/concurrent_se_vision/reconstructor/l2_relief_w3.ts

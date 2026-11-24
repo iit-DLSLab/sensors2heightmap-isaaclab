@@ -35,7 +35,8 @@ Run everything from the repository root with Isaac Lab's Python.
 
 ## Usage
 
-Collect (train seeds 42-45, test seeds 7-8, with and without `--forward_commands`; at most 500 envs):
+Collect (train seeds 42-45, test seeds 7-8, with and without `--forward_commands`; at most 500 envs). The L2 in
+`robots/go2.py` is the one the reference model's data were collected with:
 
 ```bash
 python train/collect_sensors2heightmap.py --task=Locomotion-Go2-Rough-Vision --num_envs=496 \
@@ -44,13 +45,13 @@ python train/collect_sensors2heightmap.py --task=Locomotion-Go2-Rough-Vision --n
   --dataset_path=<data>/lidar_fwd_train_seed42
 ```
 
-Train (`--proprio_noise` adds the robot's IMU and joint noise; `--step_on_message` steps the network at every LiDAR
-message, ~15 Hz, with the proprioception still at the 50 Hz control step, and `--segment_length` counts messages):
+Train. The defaults are the reference recipe (`l2_relief_w3`): one step per LiDAR message (~15 Hz, proprioception at
+50 Hz) with the robot's IMU and joint noise, segments of 32 messages, 200 epochs, loss x3 on cells more than 4 cm off
+the floor under the body. The `.ts` is exported next to the `.pt`; `--bag_eval <rosbags>` also scores it on robot bags.
 
 ```bash
 python train/terrain_reconstruction_mlp.py --dataset_path <data>/lidar_*train_seed* \
-  --test_dataset_path <data>/lidar_*test_seed* --model_path <models>/lidar.pt --proprio_noise \
-  --step_on_message --segment_length 32 --wandb
+  --test_dataset_path <data>/lidar_*test_seed* --model_path <models>/lidar.pt --wandb
 ```
 
 `--lidar_window 3` gives the network the last 3 LiDAR messages: `--lidar_window_mode aligned` moves the older ones into
@@ -89,7 +90,7 @@ with a LiDAR window run with their window; the `.ts` carries it.
 The node runs torch on one thread (`--threads`). The controller shares the CPU, so give it one torch and one onnxruntime
 thread as well, or both loops slow down: the policy then runs far below 50 Hz and the robot falls.
 
-A trained L2 reconstructor for the example policy: `example_policy/go2/concurrent_se_vision/reconstructor/`.
+The reference L2 reconstructor for the example policy: `example_policy/go2/concurrent_se_vision/reconstructor/l2_relief_w3.ts`.
 
 ## License
 

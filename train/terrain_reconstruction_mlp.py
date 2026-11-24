@@ -17,9 +17,9 @@ from torch import Tensor, nn
 from torch.utils.checkpoint import checkpoint
 from torch.utils.data import DataLoader, Dataset, RandomSampler, Subset
 from tqdm import tqdm
-import config as deploy_config
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from deploy import config as deploy_config  # noqa: E402
 import provenance  # noqa: E402
 import robots  # noqa: E402
 from sensors import lidar_grid  # noqa: E402
@@ -954,12 +954,17 @@ def run_terrain_reconstruction(
     )
 
     bag_metrics = {}
+    from deploy.terrain_reconstructor import export
+
+    try:
+        export(str(output_path), str(output_path.with_suffix(".ts")))
+    except Exception as error:  # noqa: BLE001
+        print(f"[ERROR] Export failed: {error!r}")
+        bag_eval = None
     if bag_eval:
-        from deploy.terrain_reconstructor import export
         from tested.bag_offset import evaluate, print_metrics
 
-        try:  
-            export(str(output_path), str(output_path.with_suffix(".ts")))
+        try:
             bag_metrics = evaluate(output_path.with_suffix(".ts"), bag_eval)
             print_metrics(bag_metrics)
             saved["bag_metrics"] = bag_metrics
@@ -1248,12 +1253,14 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--proprio_noise",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=True,
         help="Noisy proprioception in training, as the robot's readings (the task's observation_noise_std).",
     )
     parser.add_argument(
         "--step_on_message",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=True,
         help="The reconstructor steps at every LiDAR message (~15 Hz) instead of every control step (50 Hz); the "
         "proprioception history stays at the control step. --segment_length then counts messages (e.g. 32).",
     )
@@ -1271,10 +1278,10 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="With --init_checkpoint: the fusion MLP starts from random weights.",
     )
-    parser.add_argument("--epochs", type=int, default=100, help="Number of training epochs.")
+    parser.add_argument("--epochs", type=int, default=200, help="Number of training epochs.")
     parser.add_argument("--batch_size", type=int, default=32, help="Segments per batch.")
     parser.add_argument(
-        "--segment_length", type=int, default=96,
+        "--segment_length", type=int, default=32,
         help="Consecutive steps of the reconstructor (one env) per sample; the memory starts at zero."
     )
     parser.add_argument(
@@ -1283,13 +1290,13 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--samples_per_epoch", type=int, default=4000, help="Random training segments per epoch (0: all).")
     parser.add_argument("--max_val_samples", type=int, default=400, help="Fixed random subset of validation segments (0: all).")
     parser.add_argument("--learning_rate", type=float, default=3e-4, help="Peak learning rate (cosine schedule).")
-    parser.add_argument("--num_workers", type=int, default=6, help="DataLoader worker processes that read samples from disk.")
+    parser.add_argument("--num_workers", type=int, default=4, help="DataLoader worker processes that read samples from disk.")
     parser.add_argument("--device", type=str, default=None, help="Training device. Defaults to cuda if available.")
     parser.add_argument("--wandb", action="store_true", help="Log training metrics to Weights & Biases.")
     parser.add_argument("--wandb_project", type=str, default="sensors2heightmap", help="W&B project name.")
     parser.add_argument("--run_name", type=str, default=None, help="W&B run name.")
     parser.add_argument(
-        "--relief_weight", type=float, default=1.0,
+        "--relief_weight", type=float, default=3.0,
         help="Loss weight of the cells more than --relief_threshold above or below the floor under the body (the "
         "median of the true map's cells under it); 1: every cell counts the same (the earlier models).",
     )
